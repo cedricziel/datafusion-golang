@@ -123,6 +123,28 @@ char *df_session_register_scalar_udf(df_session_t session, const char *name,
                                      struct ArrowSchema *return_type,
                                      uintptr_t handle);
 
+/*
+ * Register a Go-implemented catalog under the given name, making
+ * `name.schema.table` queryable via SQL. `handle` follows the same
+ * ownership contract as df_session_register_table: it passes to the
+ * engine on entry, and on a rejected duplicate-name registration the
+ * engine calls go_catalog_release before returning.
+ *
+ * The engine's default catalog name is not special-cased: registering
+ * under it replaces the default catalog outright (this call still
+ * succeeds) rather than erroring, and any tables/functions previously
+ * registered via df_session_register_table/df_session_register_scalar_udf
+ * become unreachable through SQL as a result. Registering under any other
+ * name already in use returns an error and leaves the existing catalog
+ * unchanged.
+ *
+ * Nothing is fetched from Go during this call: schemas and tables are
+ * discovered lazily, per query, by calling back into Go through the
+ * catalog/schema trampolines below. Returns NULL on success, or an error
+ * string (freed via df_string_free) on failure.
+ */
+char *df_session_register_catalog(df_session_t session, const char *name, uintptr_t handle);
+
 /* Release a session context and all engine resources it owns. */
 void df_session_free(df_session_t session);
 
@@ -160,6 +182,36 @@ void df_string_free(char *s);
  * *error_out and leaves the out params untouched.
  *
  * go_table_release / go_scalar_udf_release: drop the Go-side handle.
+ *
+ * go_catalog_schema_names: export the catalog's current schema names as
+ * one JSON array-of-strings document (e.g. ["a","b"]) into a
+ * malloc-allocated *out_names_json (freed by the Rust side with free), or
+ * set *error_out. Called fresh for every query that needs it (no caching).
+ *
+ * go_catalog_schema_lookup: resolve `name` to a schema. On success sets
+ * *out_found (0 or 1); when 1, *out_schema_handle is a fresh opaque
+ * handle identifying the resolved schema (later passed to the
+ * go_schema_* trampolines and released via go_schema_release), and when
+ * 0 the schema does not exist (not an error). Sets *error_out only on a
+ * genuine failure (I/O, timeout, ...), leaving the other out-params
+ * untouched.
+ *
+ * go_catalog_release: drop the Go-side catalog handle.
+ *
+ * go_schema_table_names: export the schema's current table names, same
+ * shape and calling convention as go_catalog_schema_names.
+ *
+ * go_schema_table_lookup: resolve `name` to a table. On success sets
+ * *out_found (0 or 1); when 1, *out_table_handle and
+ * *out_supports_pushdown carry the same shape df_session_register_table's
+ * `handle`/`supports_pushdown` do — the returned handle is fed directly
+ * into the same table-provider machinery a directly-registered table
+ * uses (go_table_schema/go_table_scan/go_table_release), no separate
+ * lookup-table trampoline exists. When 0 the table does not exist (not an
+ * error). Sets *error_out only on a genuine failure, leaving the other
+ * out-params untouched.
+ *
+ * go_schema_release: drop the Go-side schema handle.
  */
 extern void go_table_schema(uintptr_t handle, struct ArrowSchema *out_schema, char **error_out);
 /*
@@ -174,6 +226,20 @@ extern void go_scalar_udf_invoke(uintptr_t handle, struct ArrowArray *args_array
                                  struct ArrowSchema *args_schema, struct ArrowArray *out_array,
                                  struct ArrowSchema *out_schema, char **error_out);
 extern void go_scalar_udf_release(uintptr_t handle);
+
+/*
+ * (name is logically const — the callee only reads it — but cgo cannot
+ * express const in exported prototypes, matching go_table_scan above.)
+ */
+extern void go_catalog_schema_names(uintptr_t handle, char **out_names_json, char **error_out);
+extern void go_catalog_schema_lookup(uintptr_t handle, char *name, uintptr_t *out_schema_handle,
+                                     uint8_t *out_found, char **error_out);
+extern void go_catalog_release(uintptr_t handle);
+extern void go_schema_table_names(uintptr_t handle, char **out_names_json, char **error_out);
+extern void go_schema_table_lookup(uintptr_t handle, char *name, uintptr_t *out_table_handle,
+                                   uint8_t *out_supports_pushdown, uint8_t *out_found,
+                                   char **error_out);
+extern void go_schema_release(uintptr_t handle);
 
 #ifdef __cplusplus
 }

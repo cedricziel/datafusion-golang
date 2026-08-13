@@ -158,26 +158,16 @@ impl ScalarUDFImpl for GoScalarUdf {
 
 #[cfg(test)]
 mod tests {
-    use crate::ffi::tests::{released_udfs, udf_invocations, UDF_DOUBLE, UDF_INVOKE_ERR};
-    use crate::{
-        df_session_free, df_session_new, df_session_register_scalar_udf, df_session_sql,
-        df_string_free,
+    use crate::ffi::tests::{
+        new_session, query, released_udfs, udf_invocations, UDF_DOUBLE, UDF_INVOKE_ERR,
     };
+    use crate::{df_session_free, df_session_register_scalar_udf, df_string_free};
 
-    use std::ffi::{c_char, CStr, CString};
-    use std::mem::MaybeUninit;
+    use std::ffi::{CStr, CString};
 
     use arrow::array::{Int64Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::ffi::FFI_ArrowSchema;
-    use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-
-    unsafe fn new_session() -> *mut std::ffi::c_void {
-        let mut err: *mut c_char = std::ptr::null_mut();
-        let session = df_session_new(&mut err);
-        assert!(err.is_null());
-        session
-    }
 
     fn int64_args_schema() -> FFI_ArrowSchema {
         let schema = Schema::new(vec![Field::new("x", DataType::Int64, true)]);
@@ -206,22 +196,6 @@ mod tests {
             df_string_free(err);
             Some(msg)
         }
-    }
-
-    unsafe fn query(session: *mut std::ffi::c_void, sql: &str) -> Result<Vec<RecordBatch>, String> {
-        let csql = CString::new(sql).unwrap();
-        let mut stream = MaybeUninit::<FFI_ArrowArrayStream>::uninit();
-        let err = df_session_sql(session, csql.as_ptr(), stream.as_mut_ptr());
-        if !err.is_null() {
-            let msg = CStr::from_ptr(err).to_string_lossy().into_owned();
-            df_string_free(err);
-            return Err(msg);
-        }
-        let mut stream = stream.assume_init();
-        let reader = ArrowArrayStreamReader::from_raw(&mut stream).map_err(|e| e.to_string())?;
-        reader
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())
     }
 
     fn int64_col(batches: &[RecordBatch], col: usize) -> Vec<i64> {
