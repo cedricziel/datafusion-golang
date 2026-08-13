@@ -43,11 +43,56 @@ type TableProvider interface {
 	Scan(ctx context.Context) (array.RecordReader, error)
 }
 
+// ScanOptions carries the pushdown information for one scan of a
+// PushdownTableProvider.
+//
+// Projection is the ordered list of column indices (into the registered
+// schema) the query requires. nil means all columns; an empty non-nil
+// slice means zero columns (the query only needs row counts). The
+// provider MUST return exactly the projected columns, in that order — the
+// engine validates the returned schema and fails the query on a mismatch.
+// Use ProjectReader to satisfy this from a full-width reader.
+//
+// Filters are the query's pushable predicates, combined with implicit
+// AND. They are strictly advisory: the engine re-applies every pushed
+// filter to the scan's output, so ignoring them (entirely or partially)
+// never changes query results. A provider may use them only to omit rows
+// that cannot satisfy the filters; it MUST NOT omit rows that match.
+//
+// Limit is an advisory fetch hint: the provider may stop after producing
+// at least that many rows, or ignore it; the engine enforces the query's
+// limit regardless. -1 means no hint. The engine can only push a limit
+// past its own re-applied filters, so whenever a query's WHERE clause is
+// pushed down, Limit is -1.
+type ScanOptions struct {
+	Projection []int
+	Filters    []Expr
+	Limit      int64
+}
+
+// PushdownTableProvider is an optional extension of TableProvider. A
+// provider that implements it is registered with scan pushdown enabled:
+// the engine calls ScanWithOptions instead of Scan for every query,
+// passing the projected column set, the pushable filters, and the limit
+// hint. Providers implementing only TableProvider keep full-scan
+// behavior, unchanged.
+type PushdownTableProvider interface {
+	TableProvider
+	// ScanWithOptions starts a scan honoring opts.Projection exactly and
+	// optionally using opts.Filters/opts.Limit to skip data. The returned
+	// reader follows the same contract as TableProvider.Scan.
+	ScanWithOptions(ctx context.Context, opts *ScanOptions) (array.RecordReader, error)
+}
+
 // RegisterTable registers a Go-implemented table under the given name,
 // making it queryable via SQL on this session. Registering a name that is
 // already in use returns an error and leaves the existing table
 // unchanged. The engine holds a reference to the provider until the
 // session is closed.
+//
+// If the provider also implements PushdownTableProvider, it is registered
+// with scan pushdown enabled; the capability is detected here and needs
+// no separate configuration.
 func (s *SessionContext) RegisterTable(name string, provider TableProvider) error {
 	if provider == nil {
 		return errors.New("datafusion: table provider is nil")
@@ -62,11 +107,16 @@ func (s *SessionContext) RegisterTable(name string, provider TableProvider) erro
 	cName := C.CString(name)
 	defer C.free(unsafe.Pointer(cName))
 
+	var supportsPushdown C.uint8_t
+	if _, ok := provider.(PushdownTableProvider); ok {
+		supportsPushdown = 1
+	}
+
 	// Ownership of the handle passes to the engine on entry: on success it
 	// is released when the session is freed, on failure the engine calls
 	// go_table_release before returning (see datafusion_go.h).
 	handle := cgo.NewHandle(provider)
-	cErr := C.df_session_register_table(s.handle, cName, C.uintptr_t(handle))
+	cErr := C.df_session_register_table(s.handle, cName, C.uintptr_t(handle), supportsPushdown)
 	return cErrorToGo(cErr)
 }
 
@@ -101,11 +151,41 @@ func go_table_schema(handle C.uintptr_t, outSchema *C.struct_ArrowSchema, errOut
 }
 
 //export go_table_scan
-func go_table_scan(handle C.uintptr_t, outStream *C.struct_ArrowArrayStream, errOut **C.char) {
+func go_table_scan(handle C.uintptr_t, projection *C.int32_t, projectionLen C.intptr_t,
+	filtersJSON *C.char, limit C.int64_t,
+	outStream *C.struct_ArrowArrayStream, errOut **C.char) {
 	defer trapCallbackPanic("TableProvider.Scan", errOut)
 
 	provider := cgo.Handle(handle).Value().(TableProvider)
-	reader, err := provider.Scan(context.Background())
+
+	var reader array.RecordReader
+	var err error
+	if pd, ok := provider.(PushdownTableProvider); ok {
+		opts := &ScanOptions{Limit: int64(limit)}
+		if projectionLen >= 0 {
+			opts.Projection = make([]int, int(projectionLen))
+			if projectionLen > 0 {
+				for i, idx := range unsafe.Slice((*int32)(projection), int(projectionLen)) {
+					opts.Projection[i] = int(idx)
+				}
+			}
+		}
+		if filtersJSON != nil {
+			// Serializer and parser ship in one binary, so a decode
+			// failure is a bug: surface it loudly instead of scanning
+			// with silently dropped filters (design D7).
+			opts.Filters, err = decodeFilters([]byte(C.GoString(filtersJSON)))
+			if err != nil {
+				setCallbackError(errOut, err.Error())
+				return
+			}
+		}
+		reader, err = pd.ScanWithOptions(context.Background(), opts)
+	} else {
+		// Non-pushdown providers keep today's full scan; the engine
+		// passes the no-pushdown sentinels and projects/filters itself.
+		reader, err = provider.Scan(context.Background())
+	}
 	if err != nil {
 		setCallbackError(errOut, err.Error())
 		return
@@ -117,6 +197,73 @@ func go_table_scan(handle C.uintptr_t, outStream *C.struct_ArrowArrayStream, err
 	// The exported stream takes ownership of the reader; its release
 	// callback releases the reader when the engine is done with it.
 	cdata.ExportRecordReader(reader, (*cdata.CArrowArrayStream)(unsafe.Pointer(outStream)))
+}
+
+// ProjectReader wraps a RecordReader so it yields exactly the columns at
+// the given indices (into the wrapped reader's schema), in that order. It
+// is the easy way for a PushdownTableProvider whose backing store cannot
+// select columns natively to honor ScanOptions.Projection exactly.
+// Ownership of the wrapped reader passes to the returned reader.
+// ProjectReader panics if an index is out of range for the schema.
+func ProjectReader(reader array.RecordReader, indices []int) array.RecordReader {
+	schema := reader.Schema()
+	fields := make([]arrow.Field, len(indices))
+	for i, idx := range indices {
+		if idx < 0 || idx >= schema.NumFields() {
+			panic(fmt.Sprintf("datafusion: ProjectReader index %d out of range for schema with %d fields", idx, schema.NumFields()))
+		}
+		fields[i] = schema.Field(idx)
+	}
+	return &projectedReader{
+		inner:   reader,
+		schema:  arrow.NewSchema(fields, nil),
+		indices: indices,
+	}
+}
+
+type projectedReader struct {
+	inner   array.RecordReader
+	schema  *arrow.Schema
+	indices []int
+	cur     arrow.RecordBatch
+}
+
+func (p *projectedReader) Schema() *arrow.Schema { return p.schema }
+
+func (p *projectedReader) Next() bool {
+	if p.cur != nil {
+		p.cur.Release()
+		p.cur = nil
+	}
+	if !p.inner.Next() {
+		return false
+	}
+	rec := p.inner.RecordBatch()
+	cols := make([]arrow.Array, len(p.indices))
+	for i, idx := range p.indices {
+		cols[i] = rec.Column(idx)
+	}
+	// NewRecordBatch retains the columns, so the projected batch stays
+	// valid independent of the inner reader's current record.
+	p.cur = array.NewRecordBatch(p.schema, cols, rec.NumRows())
+	return true
+}
+
+func (p *projectedReader) RecordBatch() arrow.RecordBatch { return p.cur }
+
+// Record implements the deprecated accessor of array.RecordReader.
+func (p *projectedReader) Record() arrow.RecordBatch { return p.cur }
+
+func (p *projectedReader) Err() error { return p.inner.Err() }
+
+func (p *projectedReader) Retain() { p.inner.Retain() }
+
+func (p *projectedReader) Release() {
+	if p.cur != nil {
+		p.cur.Release()
+		p.cur = nil
+	}
+	p.inner.Release()
 }
 
 //export go_table_release
