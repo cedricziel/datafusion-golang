@@ -9,7 +9,9 @@ crate-type = ["staticlib"]
 
 [dependencies]
 arrow = { version = "58.4.0", features = ["ffi"] }
+async-trait = "0.1"
 datafusion = "54.1.0"
+futures = "0.3"
 tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
 
 [dev-dependencies]
