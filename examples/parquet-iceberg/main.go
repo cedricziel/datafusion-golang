@@ -1,19 +1,25 @@
 // Command parquet-iceberg demonstrates registering a Parquet-backed table
 // provider and an Iceberg-backed table provider on the same session, then
-// joining across both with one SQL query.
+// joining across both with one SQL query. It also demonstrates opening the
+// same Iceberg table a second way — through an Iceberg REST catalog client
+// (NewTableProviderFromCatalog) instead of a direct metadata.json path.
 //
 // Both providers are opt-in packages, separate from the core datafusion
 // module: providers/parquet needs only a local Parquet file, and
 // providers/iceberg needs only a local table's metadata.json (no catalog
-// service). This example builds small fixtures for both under a temp
-// directory so it runs standalone; a real program would point at existing
-// files instead.
+// service) or a caller-supplied catalog client. This example builds small
+// fixtures for both, plus a minimal in-process REST catalog server, under a
+// temp directory so it runs standalone; a real program would point at
+// existing files and a real catalog service instead.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 
@@ -23,6 +29,7 @@ import (
 	pqparquet "github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/apache/iceberg-go/catalog/hadoop"
+	"github.com/apache/iceberg-go/catalog/rest"
 	icebergtable "github.com/apache/iceberg-go/table"
 	"github.com/cedricziel/datafusion-golang/datafusion"
 	icebergprovider "github.com/cedricziel/datafusion-golang/providers/iceberg"
@@ -78,6 +85,69 @@ func main() {
 	if err := reader.Err(); err != nil {
 		log.Fatalf("reading result: %v", err)
 	}
+
+	// The same Iceberg table can also be opened through a catalog client
+	// instead of its metadata.json path — resolving it by namespace and
+	// table name via any github.com/apache/iceberg-go/catalog.Catalog
+	// implementation. Here that's the REST catalog client against a
+	// minimal in-process fake server; a real program would point at an
+	// actual REST catalog service.
+	restSrv := startRESTCatalogFake(ordersMetaLoc)
+	defer restSrv.Close()
+
+	restCat, err := rest.NewCatalog(ctx, "example", restSrv.URL)
+	if err != nil {
+		log.Fatalf("rest.NewCatalog: %v", err)
+	}
+	ordersViaCatalog, err := icebergprovider.NewTableProviderFromCatalog(ctx, restCat, "default", "orders")
+	if err != nil {
+		log.Fatalf("iceberg.NewTableProviderFromCatalog: %v", err)
+	}
+	if err := sess.RegisterTable("orders_via_catalog", ordersViaCatalog); err != nil {
+		log.Fatalf("RegisterTable(orders_via_catalog): %v", err)
+	}
+
+	catalogReader, err := sess.SQL("SELECT product_id, quantity FROM orders_via_catalog ORDER BY product_id")
+	if err != nil {
+		log.Fatalf("SQL: %v", err)
+	}
+	defer catalogReader.Release()
+
+	for catalogReader.Next() {
+		fmt.Println(catalogReader.RecordBatch())
+	}
+	if err := catalogReader.Err(); err != nil {
+		log.Fatalf("reading catalog result: %v", err)
+	}
+}
+
+// startRESTCatalogFake serves just enough of the Iceberg REST catalog
+// protocol (GET /v1/config, GET /v1/namespaces/{ns}/tables/{table}) for
+// catalog/rest's client to load one table, by reading that table's real
+// metadata.json off disk and returning it verbatim. A real REST catalog
+// service implements the full protocol (namespace/table management,
+// commits, credential vending, ...); this fake exists only so the example
+// runs standalone with no external service.
+func startRESTCatalogFake(metadataLocation string) *httptest.Server {
+	metadataBytes, err := os.ReadFile(metadataLocation)
+	if err != nil {
+		log.Fatalf("reading orders metadata.json: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/config", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"defaults":  map[string]any{},
+			"overrides": map[string]any{},
+		})
+	})
+	mux.HandleFunc("/v1/namespaces/default/tables/orders", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"metadata-location": %q, "metadata": %s}`, metadataLocation, metadataBytes)
+	})
+
+	return httptest.NewServer(mux)
 }
 
 func productsSchema() *arrow.Schema {
