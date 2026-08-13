@@ -7,6 +7,7 @@
 //! success.
 
 mod ffi;
+mod pushdown;
 mod table;
 mod udf;
 
@@ -142,7 +143,9 @@ pub unsafe extern "C" fn df_session_sql(
 /// Go-side token; ownership passes to this function on entry. On success
 /// the engine retains it until the session is freed; on failure it is
 /// released via `go_table_release` before returning (see the header
-/// contract). Returns NULL on success or an error string on failure.
+/// contract). `supports_pushdown` (0/1) declares whether the provider
+/// accepts scan pushdown (design D4). Returns NULL on success or an error
+/// string on failure.
 ///
 /// # Safety
 /// `session` must be a live handle returned by [`df_session_new`]. `name`
@@ -153,6 +156,7 @@ pub unsafe extern "C" fn df_session_register_table(
     session: *mut c_void,
     name: *const c_char,
     handle: usize,
+    supports_pushdown: u8,
 ) -> *mut c_char {
     if session.is_null() {
         return error_to_cstring("session handle is null");
@@ -177,7 +181,7 @@ pub unsafe extern "C" fn df_session_register_table(
 
         // try_new releases the handle itself on failure; after this point
         // the provider's Drop impl owns the release.
-        let provider = GoTableProvider::try_new(handle)?;
+        let provider = GoTableProvider::try_new(handle, supports_pushdown != 0)?;
         ctx.register_table(name, Arc::new(provider))
             .map_err(|e| format!("registering table '{name}': {e}"))?;
         Ok(())

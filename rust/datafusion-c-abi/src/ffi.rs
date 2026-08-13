@@ -20,6 +20,10 @@ extern "C" {
     );
     pub(crate) fn go_table_scan(
         handle: usize,
+        projection: *const i32,
+        projection_len: isize,
+        filters_json: *const c_char,
+        limit: i64,
         out_stream: *mut FFI_ArrowArrayStream,
         error_out: *mut *mut c_char,
     );
@@ -105,6 +109,35 @@ pub(crate) mod tests {
     pub const TABLE_SCAN_OPEN_ERR: usize = 4;
     pub const UDF_DOUBLE: usize = 5;
     pub const UDF_INVOKE_ERR: usize = 6;
+    /// Honors the projection it receives (a well-behaved pushdown table).
+    pub const TABLE_PUSHDOWN_OK: usize = 7;
+    /// Ignores the projection and always returns the full schema (a
+    /// pushdown table violating the projection contract).
+    pub const TABLE_PUSHDOWN_WRONG_SCHEMA: usize = 8;
+
+    /// What one `go_table_scan` call received, recorded by the stub.
+    #[derive(Debug, Clone)]
+    pub struct ScanRecord {
+        pub handle: usize,
+        pub projection: Option<Vec<i32>>,
+        pub filters_json: Option<String>,
+        pub limit: i64,
+    }
+
+    fn scan_records_lock() -> &'static Mutex<Vec<ScanRecord>> {
+        static V: OnceLock<Mutex<Vec<ScanRecord>>> = OnceLock::new();
+        V.get_or_init(|| Mutex::new(vec![]))
+    }
+
+    pub fn scan_records_for(handle: usize) -> Vec<ScanRecord> {
+        scan_records_lock()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.handle == handle)
+            .cloned()
+            .collect()
+    }
 
     fn released_tables_lock() -> &'static Mutex<Vec<usize>> {
         static V: OnceLock<Mutex<Vec<usize>>> = OnceLock::new();
@@ -196,9 +229,53 @@ pub(crate) mod tests {
     #[no_mangle]
     extern "C" fn go_table_scan(
         handle: usize,
+        projection: *const i32,
+        projection_len: isize,
+        filters_json: *const c_char,
+        limit: i64,
         out_stream: *mut FFI_ArrowArrayStream,
         error_out: *mut *mut c_char,
     ) {
+        let projection = if projection_len < 0 {
+            None
+        } else {
+            Some(if projection_len == 0 {
+                vec![]
+            } else {
+                unsafe { std::slice::from_raw_parts(projection, projection_len as usize) }.to_vec()
+            })
+        };
+        let filters = if filters_json.is_null() {
+            None
+        } else {
+            Some(
+                unsafe { CStr::from_ptr(filters_json) }
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
+        scan_records_lock().lock().unwrap().push(ScanRecord {
+            handle,
+            projection: projection.clone(),
+            filters_json: filters,
+            limit,
+        });
+
+        let project = |batches: Vec<RecordBatch>| -> (SchemaRef, Vec<RecordBatch>) {
+            match &projection {
+                Some(indices) => {
+                    let indices: Vec<usize> = indices.iter().map(|&i| i as usize).collect();
+                    let schema = Arc::new(stub_schema().project(&indices).unwrap());
+                    let batches = batches
+                        .into_iter()
+                        .map(|b| b.project(&indices).unwrap())
+                        .collect();
+                    (schema, batches)
+                }
+                None => (stub_schema(), batches),
+            }
+        };
+
         unsafe {
             match handle % 10 {
                 TABLE_SCAN_OPEN_ERR => {
@@ -214,9 +291,17 @@ pub(crate) mod tests {
                     let iter = RecordBatchIterator::new(items, schema);
                     std::ptr::write(out_stream, FFI_ArrowArrayStream::new(Box::new(iter)));
                 }
-                _ => {
+                TABLE_PUSHDOWN_WRONG_SCHEMA => {
+                    // Deliberately ignores the projection: full schema back.
                     let batches = stub_batches();
                     let schema = batches[0].schema();
+                    let iter = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+                    std::ptr::write(out_stream, FFI_ArrowArrayStream::new(Box::new(iter)));
+                }
+                _ => {
+                    // TABLE_OK ignores the (always absent) pushdown params;
+                    // TABLE_PUSHDOWN_OK honors the projection exactly.
+                    let (schema, batches) = project(stub_batches());
                     let iter = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
                     std::ptr::write(out_stream, FFI_ArrowArrayStream::new(Box::new(iter)));
                 }

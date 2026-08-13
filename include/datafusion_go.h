@@ -91,11 +91,18 @@ char *df_session_sql(df_session_t session, const char *sql, struct ArrowArrayStr
  * schema fetch error, ...) the engine calls go_table_release before
  * returning, and the caller must NOT release the handle itself.
  *
+ * `supports_pushdown` (0 or 1) declares whether the provider accepts scan
+ * pushdown: when set, the engine classifies the query's filters during
+ * planning and passes projection/filters/limit to go_table_scan; when
+ * clear, every go_table_scan call carries the no-pushdown sentinels and
+ * the engine projects and filters after the scan, exactly as before.
+ *
  * The table's schema is fetched exactly once, via go_table_schema, during
  * this call. Returns NULL on success, or an error string (freed via
  * df_string_free) on failure.
  */
-char *df_session_register_table(df_session_t session, const char *name, uintptr_t handle);
+char *df_session_register_table(df_session_t session, const char *name, uintptr_t handle,
+                                uint8_t supports_pushdown);
 
 /*
  * Register a Go-implemented scalar function under the given name.
@@ -132,8 +139,18 @@ void df_string_free(char *s);
  * go_table_schema: export the table's schema into *out_schema (which the
  * caller passes zero-initialized) or set *error_out.
  *
- * go_table_scan: start a full-table scan, exporting an Arrow C Stream
- * into *out_stream (zero-initialized by the caller) or set *error_out.
+ * go_table_scan: start a table scan, exporting an Arrow C Stream into
+ * *out_stream (zero-initialized by the caller) or set *error_out. The
+ * pushdown parameters are borrowed by the callee for the duration of the
+ * call only (the caller owns and frees them):
+ *   - projection/projection_len: the ordered column indices (into the
+ *     registered schema) the scan must return. projection_len == -1 means
+ *     no projection (full schema); 0 means zero columns. For tables
+ *     registered without supports_pushdown, always NULL/-1, and the
+ *     stream must carry the full registered schema.
+ *   - filters_json: the pushed filter predicates as one JSON document
+ *     (see datafusion/expr.go for the format), or NULL when none.
+ *   - limit: advisory fetch hint; -1 means none.
  *
  * go_scalar_udf_invoke: evaluate one batch. args_array/args_schema carry
  * a struct array whose N children are the N argument columns; ownership
@@ -145,7 +162,13 @@ void df_string_free(char *s);
  * go_table_release / go_scalar_udf_release: drop the Go-side handle.
  */
 extern void go_table_schema(uintptr_t handle, struct ArrowSchema *out_schema, char **error_out);
-extern void go_table_scan(uintptr_t handle, struct ArrowArrayStream *out_stream, char **error_out);
+/*
+ * (The pointer parameters are logically const — the callee only reads
+ * them — but cgo cannot express const in exported prototypes.)
+ */
+extern void go_table_scan(uintptr_t handle, int32_t *projection, intptr_t projection_len,
+                          char *filters_json, int64_t limit,
+                          struct ArrowArrayStream *out_stream, char **error_out);
 extern void go_table_release(uintptr_t handle);
 extern void go_scalar_udf_invoke(uintptr_t handle, struct ArrowArray *args_array,
                                  struct ArrowSchema *args_schema, struct ArrowArray *out_array,
