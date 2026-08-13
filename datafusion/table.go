@@ -137,6 +137,15 @@ func trapCallbackPanic(what string, errOut **C.char) {
 	}
 }
 
+// releaseCgoHandle deletes a cgo.Handle minted for a registered
+// implementation (table, scalar UDF, catalog, or schema), used by every
+// go_*_release trampoline. A bad handle must never panic across the FFI
+// boundary during drop.
+func releaseCgoHandle(handle C.uintptr_t) {
+	defer func() { _ = recover() }()
+	cgo.Handle(handle).Delete()
+}
+
 //export go_table_schema
 func go_table_schema(handle C.uintptr_t, outSchema *C.struct_ArrowSchema, errOut **C.char) {
 	defer trapCallbackPanic("TableProvider.Schema", errOut)
@@ -268,7 +277,5 @@ func (p *projectedReader) Release() {
 
 //export go_table_release
 func go_table_release(handle C.uintptr_t) {
-	// Never let a bad handle panic across the FFI boundary during drop.
-	defer func() { _ = recover() }()
-	cgo.Handle(handle).Delete()
+	releaseCgoHandle(handle)
 }

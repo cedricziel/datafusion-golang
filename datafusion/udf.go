@@ -167,7 +167,5 @@ func go_scalar_udf_invoke(handle C.uintptr_t, argsArr *C.struct_ArrowArray, args
 
 //export go_scalar_udf_release
 func go_scalar_udf_release(handle C.uintptr_t) {
-	// Never let a bad handle panic across the FFI boundary during drop.
-	defer func() { _ = recover() }()
-	cgo.Handle(handle).Delete()
+	releaseCgoHandle(handle)
 }
