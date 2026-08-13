@@ -7,11 +7,12 @@ interface](https://arrow.apache.org/docs/format/CStreamInterface.html) and
 are consumed in Go as [`arrow-go`](https://github.com/apache/arrow-go)
 record batches.
 
-This is a walking skeleton: the first slice of a larger project. It proves
-the riskiest part of the design end to end — a Rust staticlib linked via
-`cgo`, executing SQL, and returning results as Arrow record batches — but it
-does not yet support registering custom data sources, UDFs, or planner
-hooks. See [Roadmap](#roadmap).
+Beyond executing SQL, a session can be extended from Go: register a
+Go-implemented table provider and query it via SQL, or register a
+Go-implemented scalar function and call it from SQL — with DataFusion
+calling back into your Go code during query execution. See
+[Extensibility](#extensibility). Planner hooks, aggregate/window UDFs, and
+catalog providers are not yet supported. See [Roadmap](#roadmap).
 
 ## Prerequisites
 
@@ -63,6 +64,79 @@ Run the bundled example:
 make run-example
 ```
 
+## Extensibility
+
+A session can be extended with Go-implemented tables and scalar functions;
+DataFusion calls back into your Go code while executing the query. See
+`examples/extend` for a complete program.
+
+### Table providers
+
+Implement `datafusion.TableProvider` and register it:
+
+```go
+type TableProvider interface {
+    Schema() *arrow.Schema
+    Scan(ctx context.Context) (array.RecordReader, error)
+}
+
+err := ctx.RegisterTable("people", provider)
+reader, err := ctx.SQL("SELECT * FROM people WHERE id > 1")
+```
+
+The schema is fetched once, at registration. `Scan` runs once per query
+execution and must return a fresh `array.RecordReader`; the engine pulls
+batches from it as the query consumes them (genuine streaming, not a full
+collect) and releases the reader when the query completes or fails.
+Errors returned mid-scan abort the query and surface as a Go error; the
+session remains usable afterwards.
+
+### Scalar UDFs
+
+Build a function with a fixed signature and register it:
+
+```go
+double, err := datafusion.NewScalarUDF(
+    "double",
+    []arrow.DataType{arrow.PrimitiveTypes.Int64}, // argument types
+    arrow.PrimitiveTypes.Int64,                   // return type
+    func(args []arrow.Array) (arrow.Array, error) {
+        // vectorized: one output value per input row
+        ...
+    },
+)
+err = ctx.RegisterScalarUDF(double)
+reader, err := ctx.SQL("SELECT double(id) FROM people")
+```
+
+Evaluation is vectorized: the function is invoked once per batch with all
+argument columns, and must return one array of the declared return type
+with one value per input row. Calls whose argument types don't match the
+declared signature are rejected during planning, before the function
+runs. Errors — and recovered panics — inside the function abort the query
+and surface as Go errors without crashing the process.
+
+### Contracts and limitations
+
+- **Goroutine safety is on you**: like an `http.Handler`, a registered
+  `TableProvider` or `ScalarUDF` may be invoked from multiple
+  engine-internal threads concurrently and must be safe for concurrent
+  use.
+- **Duplicate names are rejected**: registering a table or function name
+  already in use (including built-in function names) returns an error and
+  leaves the existing registration unchanged.
+- **Lifetime**: the engine holds references to registered implementations
+  until `Close()`, which drains in-flight queries first — after `Close`
+  returns, your implementation is never invoked again.
+- **No filter or projection pushdown yet**: every scan is a full-table
+  scan; DataFusion filters and projects after the scan.
+- **No cancellation yet**: the `context.Context` passed to `Scan` carries
+  no deadline or cancellation; a reader that blocks forever hangs its
+  query.
+- **Fixed signatures**: scalar UDFs declare exact argument/return types —
+  no variadic or generic functions, and volatility is fixed to `Volatile`
+  (never constant-folded).
+
 ## Architecture
 
 ```
@@ -85,9 +159,17 @@ Go caller receives an array.RecordReader
 Key design points (see `openspec/changes/add-walking-skeleton/design.md` for
 the full rationale):
 
-- **Custom thin C ABI**, not `datafusion-ffi`'s `abi_stable` types — four
-  functions: `df_session_new`, `df_session_sql`, `df_session_free`,
-  `df_string_free` (declared in `include/datafusion_go.h`).
+- **Custom thin C ABI**, not `datafusion-ffi`'s `abi_stable` types —
+  declared in `include/datafusion_go.h`: session lifecycle and SQL
+  execution (`df_session_new`, `df_session_sql`, `df_session_free`,
+  `df_string_free`) plus extension registration
+  (`df_session_register_table`, `df_session_register_scalar_udf`).
+- **Callbacks are fixed Go-exported symbols**, not function-pointer
+  vtables: the Rust staticlib references `go_table_schema`,
+  `go_table_scan`, `go_table_release`, `go_scalar_udf_invoke`, and
+  `go_scalar_udf_release`, resolved when the final Go binary is linked.
+  Each registration carries an opaque `cgo.Handle` identifying the Go
+  implementation.
 - **Results cross as an Arrow C Stream**, imported into a standard
   `array.RecordReader` via `arrow-go`'s `cdata` package — zero-copy.
 - **Opaque handles**: every Rust object crossing the boundary is boxed and
@@ -104,10 +186,11 @@ the full rationale):
 
 ## Roadmap
 
-This walking skeleton establishes the FFI, memory-ownership, and threading
-conventions that later phases build on:
+The FFI, memory-ownership, callback, and threading conventions are
+established; later phases build on them:
 
-- Registering custom table providers (Go-implemented data sources)
-- User-defined functions (UDFs) callable from SQL
+- Filter and projection pushdown into Go table scans
+- Aggregate and window UDFs, catalog providers
+- Cancellation (`context.Context`) wiring for scans and queries
 - Planner/optimizer hooks
 - Prebuilt binary distribution (no local Rust toolchain required)
