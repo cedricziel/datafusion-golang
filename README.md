@@ -217,8 +217,8 @@ query results are identical with and without pruning.
 
 ### `providers/iceberg`
 
-Queries a local-filesystem-backed Apache Iceberg table directly from its
-`metadata.json`, with no catalog service:
+Queries an Apache Iceberg table, opened either directly from its
+`metadata.json` (no catalog service) or resolved through a catalog client:
 
 ```go
 import icebergprovider "github.com/cedricziel/datafusion-golang/providers/iceberg"
@@ -235,6 +235,39 @@ snapshot's data files (no snapshot selection or time travel). As with the
 Parquet provider, each scan is independent and resource-safe under
 concurrent or repeated use.
 
+Alternatively, `NewTableProviderFromCatalog` resolves a table by
+namespace-qualified identifier through any
+`github.com/apache/iceberg-go/catalog.Catalog` implementation — the caller
+constructs and configures the concrete client (REST, Hive, Glue, SQL,
+Hadoop, ...) itself; `providers/iceberg` depends only on the small
+`catalog` interface package, never a specific implementation, so its own
+dependency footprint is unaffected by which catalog a caller chooses:
+
+```go
+import (
+    "github.com/apache/iceberg-go/catalog/rest"
+    icebergprovider "github.com/cedricziel/datafusion-golang/providers/iceberg"
+)
+
+cat, err := rest.NewCatalog(ctx, "prod", "https://iceberg.example.com/api", rest.WithOAuthToken(token))
+if err != nil {
+    log.Fatal(err)
+}
+table, err := icebergprovider.NewTableProviderFromCatalog(ctx, cat, "db", "orders")
+if err != nil {
+    log.Fatal(err)
+}
+err = ctx.RegisterTable("orders", table)
+```
+
+REST is the catalog client this path is tested and documented against;
+Hive, Glue, SQL, and Hadoop catalog clients work through the same
+`catalog.Catalog` interface but are not exercised or documented here.
+Unlike the metadata.json path (pinned to one specific metadata file for
+the provider's lifetime), a catalog-backed provider re-resolves the table
+through the catalog on every scan, so a commit made between two scans
+becomes visible without reconstructing the provider.
+
 The provider implements `PushdownTableProvider`: pushed filters are
 converted to Iceberg expressions and handed to iceberg-go's scan, which
 uses them for manifest-level partition pruning, per-data-file statistics
@@ -245,7 +278,9 @@ converted faithfully is dropped whole (never approximated), so pushed
 filters can only ever widen the scan — results are identical either way.
 
 **Scope boundaries (both providers):** local filesystem only — no S3,
-GCS, or Azure object stores; no Iceberg catalog services (REST/Glue/Hive).
+GCS, or Azure object stores. Iceberg catalog services are no longer
+categorically out of scope (see `NewTableProviderFromCatalog` above), but
+`providers/parquet` remains file-path-only.
 
 Run the bundled example, which registers both a Parquet- and an
 Iceberg-backed table and joins across them in one query:
