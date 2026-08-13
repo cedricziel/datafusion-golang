@@ -1,0 +1,15 @@
+# Go
+/datafusion.test
+*.test
+*.out
+
+# Rust
+/rust/target/
+**/*.rs.bk
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/

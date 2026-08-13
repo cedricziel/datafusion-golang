@@ -1,0 +1,15 @@
+[package]
+name = "datafusion-c-abi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+arrow = { version = "58.4.0", features = ["ffi"] }
+datafusion = "54.1.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
+
+[dev-dependencies]
