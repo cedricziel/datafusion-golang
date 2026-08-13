@@ -203,9 +203,17 @@ err = ctx.RegisterTable("people", table)
 
 Construction opens and validates the file up front, caching its Arrow
 schema; a bad or missing path fails immediately rather than at query time.
-Each `Scan` reads every row across all row groups via a fresh file handle,
-so concurrent and repeated scans of the same provider never interfere with
-each other or leak file descriptors.
+Each scan uses a fresh file handle, so concurrent and repeated scans of
+the same provider never interfere with each other or leak file
+descriptors.
+
+The provider implements `PushdownTableProvider`: projected-away columns
+are never decoded, pushed filters skip whole row groups whose column
+statistics (min/max, null counts) or bloom filters prove they contain no
+matching row, and a limit hint stops the scan early. Skipping is strictly
+one-directional — a row group is only skipped when the metadata *proves*
+no row can match; missing or inconclusive statistics always keep it — so
+query results are identical with and without pruning.
 
 ### `providers/iceberg`
 
@@ -224,15 +232,20 @@ err = ctx.RegisterTable("orders", table)
 
 Construction reads the table's current schema; scanning reads the current
 snapshot's data files (no snapshot selection or time travel). As with the
-Parquet provider, each `Scan` is independent and resource-safe under
+Parquet provider, each scan is independent and resource-safe under
 concurrent or repeated use.
+
+The provider implements `PushdownTableProvider`: pushed filters are
+converted to Iceberg expressions and handed to iceberg-go's scan, which
+uses them for manifest-level partition pruning, per-data-file statistics
+pruning, in-file row-group/bloom pruning, and exact row filtering;
+projection is pushed via selected fields so only the needed columns are
+read, and the limit hint is passed through. A filter that cannot be
+converted faithfully is dropped whole (never approximated), so pushed
+filters can only ever widen the scan — results are identical either way.
 
 **Scope boundaries (both providers):** local filesystem only — no S3,
 GCS, or Azure object stores; no Iceberg catalog services (REST/Glue/Hive).
-Both providers currently perform full scans: adopting the opt-in scan
-pushdown (Parquet row-group pruning via column statistics, Iceberg
-manifest-level data-file pruning) is planned follow-up work. See
-`openspec/changes/add-parquet-and-iceberg-table-providers/design.md`.
 
 Run the bundled example, which registers both a Parquet- and an
 Iceberg-backed table and joins across them in one query:
@@ -293,8 +306,6 @@ the full rationale):
 The FFI, memory-ownership, callback, and threading conventions are
 established; later phases build on them:
 
-- Parquet row-group and Iceberg manifest pruning in the built-in
-  providers, via the scan-pushdown options
 - Aggregate and window UDFs, catalog providers
 - Cancellation (`context.Context`) wiring for scans and queries
 - Planner/optimizer hooks
