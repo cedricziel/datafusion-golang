@@ -45,4 +45,4 @@
 - [x] 6.1 Extend `examples/sql` (or add `examples/extend`) demonstrating a registered table joined/filtered via SQL and a registered scalar UDF used in the same query
 - [x] 6.2 Update README: extensibility section covering `RegisterTable`/`RegisterScalarUDF`, the goroutine-safety contract on implementations, and current limitations (no pushdown, no cancellation, fixed signatures)
 - [x] 6.3 Run `make lint && make format`, ensure `go test ./... -race` and `cargo test` both pass, ensure clean tree
-- [ ] 6.4 Commit series (semantic commits: FFI groundwork, Rust table provider, Go table provider, Rust scalar UDF, Go scalar UDF, example/docs)
+- [x] 6.4 Commit series (semantic commits: FFI groundwork, Rust table provider, Go table provider, Rust scalar UDF, Go scalar UDF, example/docs)
