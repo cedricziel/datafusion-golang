@@ -1,6 +1,16 @@
 // Package iceberg provides a datafusion.TableProvider backed by a
 // local-filesystem Apache Iceberg table, opened directly from its
 // metadata.json location with no catalog service required.
+//
+// The provider implements datafusion.PushdownTableProvider, so it is
+// registered with scan pushdown enabled: pushed filters are converted to
+// Iceberg expressions and drive iceberg-go's own manifest, data-file, and
+// row-group pruning plus exact row filtering; projection is pushed via
+// selected fields; the limit hint is passed through. Pushed filters are
+// strictly advisory per the table-provider contract — a filter that
+// cannot be converted faithfully is dropped whole rather than
+// approximated, so pushdown can only ever widen the scan (the engine
+// re-applies every filter), and results are identical either way.
 package iceberg
 
 import (
@@ -61,7 +71,7 @@ func (t *tableProvider) Scan(ctx context.Context) (array.RecordReader, error) {
 		return nil, fmt.Errorf("iceberg: scan %s: %w", t.metadataLocation, err)
 	}
 
-	return array.ReaderFromIter(schema, itr), nil
+	return readerFromSeq(schema, itr), nil
 }
 
 // loadTable loads the Iceberg table at metadataLocation with no catalog
