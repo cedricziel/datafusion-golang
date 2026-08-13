@@ -1,6 +1,7 @@
 //! A DataFusion `TableProvider` backed by a Go implementation, dispatching
 //! through the fixed Go-exported trampoline symbols in [`crate::ffi`].
 
+use std::ffi::CString;
 use std::fmt;
 use std::ptr;
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use arrow::record_batch::RecordBatchReader;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::{exec_err, internal_err, DataFusionError, Result};
@@ -25,6 +27,7 @@ use datafusion::physical_plan::{
 use crate::ffi::{
     go_table_release, go_table_scan, go_table_schema, spawn_go_blocking, take_go_error,
 };
+use crate::pushdown;
 
 /// Wraps a Go-side table implementation identified by an opaque
 /// `cgo.Handle`-derived token. The schema is fetched exactly once at
@@ -33,13 +36,14 @@ use crate::ffi::{
 pub(crate) struct GoTableProvider {
     handle: usize,
     schema: SchemaRef,
+    supports_pushdown: bool,
 }
 
 impl GoTableProvider {
     /// Takes ownership of `handle`. On error the handle is released via
     /// `go_table_release` before returning, so the caller never needs to
     /// clean up.
-    pub(crate) fn try_new(handle: usize) -> Result<Self, String> {
+    pub(crate) fn try_new(handle: usize, supports_pushdown: bool) -> Result<Self, String> {
         // Registration runs on the Go caller's own thread (a direct FFI
         // call, not a tokio worker), so calling back into Go inline here
         // cannot starve the shared runtime.
@@ -54,6 +58,7 @@ impl GoTableProvider {
             Ok(schema) => Ok(Self {
                 handle,
                 schema: Arc::new(schema),
+                supports_pushdown,
             }),
             Err(e) => {
                 unsafe { go_table_release(handle) };
@@ -83,29 +88,62 @@ impl TableProvider for GoTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        // No pushdown in this phase: DataFusion filters after the scan.
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        if !self.supports_pushdown {
+            // No pushdown: DataFusion filters after the scan.
+            return Ok(vec![
+                TableProviderFilterPushDown::Unsupported;
+                filters.len()
+            ]);
+        }
+        // Pure-Rust classification, no FFI during planning (design D4).
+        // Never `Exact`: DataFusion re-applies every `Inexact` conjunct
+        // after the scan, so correctness cannot depend on what the Go
+        // provider does with a pushed filter (design D1).
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if pushdown::classify(f, &self.schema).is_some() {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
     }
 
     async fn scan(
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // The exec node outlives `self` only within a query, and queries
         // are fully drained before the session (and thus the provider)
         // is dropped (design D7), so copying the raw handle is safe.
+        let pushdown = if self.supports_pushdown {
+            Some(PushdownArgs {
+                filters_json: pushdown::filters_to_json(filters, &self.schema),
+                limit: limit.map_or(-1, |l| l as i64),
+            })
+        } else {
+            None
+        };
         Ok(Arc::new(GoTableExec::new(
             self.handle,
             Arc::clone(&self.schema),
             projection.cloned(),
+            pushdown,
         )))
     }
+}
+
+/// Scan-time pushdown payload, present only for providers registered with
+/// `supports_pushdown` (design D5).
+#[derive(Debug)]
+struct PushdownArgs {
+    filters_json: Option<CString>,
+    limit: i64,
 }
 
 /// Leaf execution plan that pulls record batches from the Arrow C Stream
@@ -116,12 +154,18 @@ impl TableProvider for GoTableProvider {
 struct GoTableExec {
     handle: usize,
     projection: Option<Vec<usize>>,
+    pushdown: Option<PushdownArgs>,
     projected_schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
 
 impl GoTableExec {
-    fn new(handle: usize, table_schema: SchemaRef, projection: Option<Vec<usize>>) -> Self {
+    fn new(
+        handle: usize,
+        table_schema: SchemaRef,
+        projection: Option<Vec<usize>>,
+        pushdown: Option<PushdownArgs>,
+    ) -> Self {
         let projected_schema = match &projection {
             Some(indices) => Arc::new(
                 table_schema
@@ -139,6 +183,7 @@ impl GoTableExec {
         Self {
             handle,
             projection,
+            pushdown,
             projected_schema,
             properties,
         }
@@ -151,27 +196,107 @@ impl DisplayAs for GoTableExec {
     }
 }
 
+/// Everything one `go_table_scan` call needs, bundled so it can move onto
+/// the blocking pool. For a non-pushdown scan the sentinels (NULL/-1) are
+/// passed and the returned stream carries the full registered schema; for
+/// a pushdown scan the projection/filters/limit cross and the returned
+/// stream's schema is validated against `expected_schema` (design D5/D6).
+struct ScanRequest {
+    handle: usize,
+    pushdown: bool,
+    projection: Option<Vec<i32>>,
+    filters_json: Option<CString>,
+    limit: i64,
+    expected_schema: SchemaRef,
+}
+
 /// The stream reader owns an `FFI_ArrowArrayStream` (which is `Send`) and
 /// a `SchemaRef`; batches are pulled strictly sequentially, so moving it
 /// between blocking-pool threads between pulls is sound.
 struct GoScanReader(ArrowArrayStreamReader);
 
-fn open_go_scan(handle: usize) -> Result<GoScanReader, String> {
+fn open_go_scan(request: &ScanRequest) -> Result<GoScanReader, String> {
+    let (projection_ptr, projection_len): (*const i32, isize) = match &request.projection {
+        Some(indices) => (indices.as_ptr(), indices.len() as isize),
+        None => (ptr::null(), -1),
+    };
+    let filters_ptr = request
+        .filters_json
+        .as_ref()
+        .map_or(ptr::null(), |f| f.as_ptr());
+
     let mut ffi_stream = FFI_ArrowArrayStream::empty();
     let mut err: *mut std::ffi::c_char = ptr::null_mut();
-    unsafe { go_table_scan(handle, &mut ffi_stream, &mut err) };
+    unsafe {
+        go_table_scan(
+            request.handle,
+            projection_ptr,
+            projection_len,
+            filters_ptr,
+            request.limit,
+            &mut ffi_stream,
+            &mut err,
+        )
+    };
     if let Some(msg) = unsafe { take_go_error(err) } {
         return Err(format!("Go table scan failed: {msg}"));
     }
     // from_raw also fetches the stream schema, i.e. one more call into Go;
     // callers must therefore invoke this on the blocking pool too.
-    unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }
-        .map(GoScanReader)
-        .map_err(|e| format!("importing Go scan stream: {e}"))
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }
+        .map_err(|e| format!("importing Go scan stream: {e}"))?;
+    if request.pushdown {
+        // Projection is a hard contract for pushdown providers: fail fast
+        // on a wrong schema instead of returning wrong columns (design D6).
+        validate_projected_schema(&request.expected_schema, reader.schema().as_ref())?;
+    }
+    Ok(GoScanReader(reader))
+}
+
+/// Compares names, types, and order; metadata and nullability are ignored
+/// (a nullability mismatch degrades to an Arrow-level error downstream,
+/// which beats rejecting a working provider).
+fn validate_projected_schema(expected: &Schema, actual: &Schema) -> Result<(), String> {
+    let mismatch = |detail: String| {
+        Err(format!(
+            "Go pushdown table scan violated the projection contract: {detail} \
+             (expected schema: {expected}, returned schema: {actual})"
+        ))
+    };
+    if actual.fields().len() != expected.fields().len() {
+        return mismatch(format!(
+            "expected {} column(s), got {}",
+            expected.fields().len(),
+            actual.fields().len()
+        ));
+    }
+    for (i, (want, got)) in expected
+        .fields()
+        .iter()
+        .zip(actual.fields().iter())
+        .enumerate()
+    {
+        if want.name() != got.name() {
+            return mismatch(format!(
+                "column {i} should be '{}', got '{}'",
+                want.name(),
+                got.name()
+            ));
+        }
+        if want.data_type() != got.data_type() {
+            return mismatch(format!(
+                "column {i} ('{}') should have type {}, got {}",
+                want.name(),
+                want.data_type(),
+                got.data_type()
+            ));
+        }
+    }
+    Ok(())
 }
 
 enum ScanState {
-    Unopened(usize),
+    Unopened,
     Open(GoScanReader),
 }
 
@@ -207,12 +332,33 @@ impl ExecutionPlan for GoTableExec {
         if partition != 0 {
             return internal_err!("GoTableExec has a single partition, got {partition}");
         }
-        let projection = self.projection.clone();
-        let stream = futures::stream::try_unfold(ScanState::Unopened(self.handle), move |state| {
-            let projection = projection.clone();
+        // Pushdown providers return the projected schema themselves; the
+        // legacy path scans the full schema and re-projects per batch in
+        // Rust (design D5).
+        let legacy_projection = match self.pushdown {
+            Some(_) => None,
+            None => self.projection.clone(),
+        };
+        let request = Arc::new(ScanRequest {
+            handle: self.handle,
+            pushdown: self.pushdown.is_some(),
+            projection: match &self.pushdown {
+                Some(_) => self
+                    .projection
+                    .as_ref()
+                    .map(|indices| indices.iter().map(|&i| i as i32).collect()),
+                None => None,
+            },
+            filters_json: self.pushdown.as_ref().and_then(|p| p.filters_json.clone()),
+            limit: self.pushdown.as_ref().map_or(-1, |p| p.limit),
+            expected_schema: Arc::clone(&self.projected_schema),
+        });
+        let stream = futures::stream::try_unfold(ScanState::Unopened, move |state| {
+            let request = Arc::clone(&request);
+            let legacy_projection = legacy_projection.clone();
             async move {
                 let mut reader = match state {
-                    ScanState::Unopened(handle) => spawn_go_blocking(move || open_go_scan(handle))
+                    ScanState::Unopened => spawn_go_blocking(move || open_go_scan(&request))
                         .await
                         .map_err(DataFusionError::Execution)?,
                     ScanState::Open(reader) => reader,
@@ -225,7 +371,7 @@ impl ExecutionPlan for GoTableExec {
                 .map_err(DataFusionError::Execution)?;
                 match item {
                     Some(Ok(batch)) => {
-                        let batch = match &projection {
+                        let batch = match &legacy_projection {
                             Some(indices) => batch.project(indices)?,
                             None => batch,
                         };
@@ -245,17 +391,22 @@ impl ExecutionPlan for GoTableExec {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::ffi::tests::{
-        released_tables, TABLE_OK, TABLE_SCAN_MIDSTREAM_ERR, TABLE_SCAN_OPEN_ERR, TABLE_SCHEMA_ERR,
+        released_tables, scan_records_for, TABLE_OK, TABLE_PUSHDOWN_OK,
+        TABLE_PUSHDOWN_WRONG_SCHEMA, TABLE_SCAN_MIDSTREAM_ERR, TABLE_SCAN_OPEN_ERR,
+        TABLE_SCHEMA_ERR,
     };
     use crate::{df_session_free, df_session_new, df_session_register_table, df_session_sql};
 
     use std::ffi::{c_char, CStr, CString};
     use std::mem::MaybeUninit;
 
-    use arrow::array::{Int64Array, RecordBatch};
+    use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field};
     use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
     use arrow::record_batch::RecordBatchReader;
+    use futures::TryStreamExt;
 
     unsafe fn new_session() -> *mut std::ffi::c_void {
         let mut err: *mut c_char = std::ptr::null_mut();
@@ -270,8 +421,18 @@ mod tests {
         name: &str,
         handle: usize,
     ) -> Option<String> {
+        register_with_pushdown(session, name, handle, false)
+    }
+
+    unsafe fn register_with_pushdown(
+        session: *mut std::ffi::c_void,
+        name: &str,
+        handle: usize,
+        supports_pushdown: bool,
+    ) -> Option<String> {
         let cname = CString::new(name).unwrap();
-        let err = df_session_register_table(session, cname.as_ptr(), handle);
+        let err =
+            df_session_register_table(session, cname.as_ptr(), handle, supports_pushdown as u8);
         if err.is_null() {
             None
         } else {
@@ -415,14 +576,194 @@ mod tests {
     fn filtered_and_projected_query() {
         unsafe {
             let session = new_session();
-            assert_eq!(register(session, "proj", TABLE_OK + 80), None);
+            let handle = TABLE_OK + 80;
+            assert_eq!(register(session, "proj", handle), None);
             // filter is applied post-scan (no pushdown); projection is
             // honored by the exec node
             let (schema, batches) = query(session, "SELECT name FROM proj WHERE id > 2").unwrap();
             assert_eq!(schema.fields().len(), 1);
             assert_eq!(schema.field(0).name(), "name");
             assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+
+            // a non-pushdown provider never receives pushdown parameters
+            let records = scan_records_for(handle);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].projection, None);
+            assert_eq!(records[0].filters_json, None);
+            assert_eq!(records[0].limit, -1);
             df_session_free(session);
         }
+    }
+
+    #[test]
+    fn pushdown_classifies_supported_and_unsupported_conjuncts() {
+        unsafe {
+            let session = new_session();
+            let handle = TABLE_PUSHDOWN_OK + 90;
+            assert_eq!(
+                register_with_pushdown(session, "pd_cls", handle, true),
+                None
+            );
+
+            let (_, batches) = query(
+                session,
+                "SELECT id, name FROM pd_cls WHERE id > 2 AND length(name) = 5",
+            )
+            .unwrap();
+            // rows: (1,alice)(2,bob)(3,carol)(4,dave); id>2 && len==5 => carol
+            assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+            let records = scan_records_for(handle);
+            assert_eq!(records.len(), 1);
+            let filters = records[0]
+                .filters_json
+                .as_deref()
+                .expect("supported conjunct must be pushed");
+            assert!(filters.contains("\"op\":\"gt\""), "got: {filters}");
+            assert!(filters.contains("\"name\":\"id\""), "got: {filters}");
+            assert!(
+                !filters.contains("length"),
+                "function conjunct must be withheld: {filters}"
+            );
+            df_session_free(session);
+        }
+    }
+
+    #[test]
+    fn pushdown_projection_is_delivered_and_not_reprojected() {
+        unsafe {
+            let session = new_session();
+            let handle = TABLE_PUSHDOWN_OK + 100;
+            assert_eq!(
+                register_with_pushdown(session, "pd_proj", handle, true),
+                None
+            );
+
+            let (schema, batches) = query(session, "SELECT name FROM pd_proj").unwrap();
+            assert_eq!(schema.fields().len(), 1);
+            assert_eq!(schema.field(0).name(), "name");
+            let names: Vec<String> = batches
+                .iter()
+                .flat_map(|b| {
+                    let col = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                    (0..col.len())
+                        .map(|i| col.value(i).to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(names, ["alice", "bob", "carol", "dave"]);
+
+            let records = scan_records_for(handle);
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].projection,
+                Some(vec![1]),
+                "scan must receive the name-column projection"
+            );
+            assert_eq!(records[0].filters_json, None);
+            df_session_free(session);
+        }
+    }
+
+    #[test]
+    fn pushdown_wrong_schema_fails_query_and_session_stays_usable() {
+        unsafe {
+            let session = new_session();
+            let handle = TABLE_PUSHDOWN_WRONG_SCHEMA + 110;
+            assert_eq!(
+                register_with_pushdown(session, "pd_bad", handle, true),
+                None
+            );
+
+            let err = query(session, "SELECT name FROM pd_bad").unwrap_err();
+            assert!(
+                err.contains("projection contract"),
+                "expected schema-mismatch error, got: {err}"
+            );
+            let (_, batches) = query(session, "SELECT 1 AS one").unwrap();
+            assert_eq!(batches[0].num_rows(), 1);
+            df_session_free(session);
+        }
+    }
+
+    #[test]
+    fn pushdown_limit_hint_arrives_for_filterless_limit() {
+        unsafe {
+            let session = new_session();
+            let handle = TABLE_PUSHDOWN_OK + 120;
+            assert_eq!(
+                register_with_pushdown(session, "pd_limit", handle, true),
+                None
+            );
+
+            let (_, batches) = query(session, "SELECT * FROM pd_limit LIMIT 3").unwrap();
+            assert_eq!(
+                batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                3,
+                "engine must enforce the limit even though the stub ignores it"
+            );
+            let records = scan_records_for(handle);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].limit, 3);
+
+            // with a pushed (Inexact) filter, the limit never reaches the scan
+            let (_, batches) =
+                query(session, "SELECT * FROM pd_limit WHERE id > 0 LIMIT 3").unwrap();
+            assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+            let records = scan_records_for(handle);
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[1].limit, -1);
+            assert!(records[1].filters_json.is_some());
+            df_session_free(session);
+        }
+    }
+
+    #[test]
+    fn pushdown_filter_only_query_returns_correct_rows() {
+        unsafe {
+            let session = new_session();
+            let handle = TABLE_PUSHDOWN_OK + 130;
+            assert_eq!(register_with_pushdown(session, "pd_f", handle, true), None);
+
+            // The stub ignores the pushed filter entirely; DataFusion's
+            // re-filter (Inexact) must still produce the right answer.
+            let (_, batches) = query(session, "SELECT id FROM pd_f WHERE id > 2").unwrap();
+            let ids: Vec<i64> = batches
+                .iter()
+                .flat_map(|b| {
+                    let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                    (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(ids, [3, 4]);
+            df_session_free(session);
+        }
+    }
+
+    #[test]
+    fn pushdown_projection_none_expects_full_schema() {
+        // SQL almost always plans an explicit projection, so exercise the
+        // `projection == None` path directly on the exec node.
+        let handle = TABLE_PUSHDOWN_OK + 140;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let exec = GoTableExec::new(
+            handle,
+            Arc::clone(&schema),
+            None,
+            Some(PushdownArgs {
+                filters_json: None,
+                limit: -1,
+            }),
+        );
+        let stream = exec.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let batches: Vec<RecordBatch> = crate::runtime().block_on(stream.try_collect()).unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+        assert_eq!(batches[0].schema().fields().len(), 2);
+        let records = scan_records_for(handle);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].projection, None, "None projection crosses as -1");
     }
 }
