@@ -8,11 +8,12 @@ are consumed in Go as [`arrow-go`](https://github.com/apache/arrow-go)
 record batches.
 
 Beyond executing SQL, a session can be extended from Go: register a
-Go-implemented table provider and query it via SQL, or register a
-Go-implemented scalar function and call it from SQL — with DataFusion
-calling back into your Go code during query execution. See
-[Extensibility](#extensibility). Planner hooks, aggregate/window UDFs, and
-catalog providers are not yet supported. See [Roadmap](#roadmap).
+Go-implemented table provider and query it via SQL, register a
+Go-implemented scalar function and call it from SQL, or register a whole
+Go-implemented catalog whose schemas and tables the engine discovers
+dynamically — with DataFusion calling back into your Go code during query
+execution. See [Extensibility](#extensibility). Planner hooks and
+aggregate/window UDFs are not yet supported. See [Roadmap](#roadmap).
 
 ## Prerequisites
 
@@ -66,9 +67,9 @@ make run-example
 
 ## Extensibility
 
-A session can be extended with Go-implemented tables and scalar functions;
-DataFusion calls back into your Go code while executing the query. See
-`examples/extend` for a complete program.
+A session can be extended with Go-implemented tables, scalar functions,
+and catalogs; DataFusion calls back into your Go code while executing the
+query. See `examples/extend` for a complete program.
 
 ### Table providers
 
@@ -156,15 +157,64 @@ declared signature are rejected during planning, before the function
 runs. Errors — and recovered panics — inside the function abort the query
 and surface as Go errors without crashing the process.
 
+### Catalogs
+
+A session can be extended with a whole catalog instead of one table at a
+time: register a Go-implemented catalog whose schemas and tables the
+engine discovers dynamically, at query time, so SQL can address
+`catalog.schema.table` against content not known when the catalog was
+registered.
+
+```go
+type CatalogProvider interface {
+    SchemaNames(ctx context.Context) ([]string, error)
+    Schema(ctx context.Context, name string) (schema SchemaProvider, found bool, err error)
+}
+
+type SchemaProvider interface {
+    TableNames(ctx context.Context) ([]string, error)
+    Table(ctx context.Context, name string) (table TableProvider, found bool, err error)
+}
+
+err := ctx.RegisterCatalog("warehouse", catalog)
+reader, err := ctx.SQL("SELECT * FROM warehouse.sales.orders")
+```
+
+`SchemaProvider.Table` returns the exact same `TableProvider` interface
+`RegisterTable` accepts — a catalog-discovered table is queried through
+the identical `Scan`/`ScanWithOptions` contract, so a program can hand the
+same implementation to either registration path with no special-casing.
+
+Nothing is cached at registration: `SchemaNames`/`Schema` and
+`TableNames`/`Table` are called fresh for every query that needs them, so
+a table (or schema) that appears after registration becomes queryable
+without re-registering the catalog. This also means a slow or blocking
+catalog implementation degrades planning latency for whatever query
+triggered it, the same "no cancellation yet" expectation `Scan` already
+has.
+
+`Schema`/`Table` returning `found = false` is not an error — it becomes
+the engine's own standard schema/table-not-found error, the same shape an
+unqualified reference to a missing table already produces. A catalog is
+read-only from SQL's perspective: there is no way to `CREATE SCHEMA` or
+`CREATE TABLE` against a Go-registered catalog.
+
+The engine's default catalog name is not special-cased: registering a Go
+catalog under it (the name `datafusion` uses by default) replaces the
+default catalog outright, and any tables or functions previously
+registered via `RegisterTable`/`RegisterScalarUDF` become unreachable
+through SQL as a result. Registering under any other name already in use
+returns an error and leaves the existing catalog unchanged.
+
 ### Contracts and limitations
 
 - **Goroutine safety is on you**: like an `http.Handler`, a registered
-  `TableProvider` or `ScalarUDF` may be invoked from multiple
-  engine-internal threads concurrently and must be safe for concurrent
-  use.
-- **Duplicate names are rejected**: registering a table or function name
-  already in use (including built-in function names) returns an error and
-  leaves the existing registration unchanged.
+  `TableProvider`, `ScalarUDF`, or `CatalogProvider`/`SchemaProvider` may
+  be invoked from multiple engine-internal threads concurrently and must
+  be safe for concurrent use.
+- **Duplicate names are rejected**: registering a table, function, or
+  (non-default) catalog name already in use (including built-in function
+  names) returns an error and leaves the existing registration unchanged.
 - **Lifetime**: the engine holds references to registered implementations
   until `Close()`, which drains in-flight queries first — after `Close`
   returns, your implementation is never invoked again.
@@ -315,12 +365,16 @@ the full rationale):
   declared in `include/datafusion_go.h`: session lifecycle and SQL
   execution (`df_session_new`, `df_session_sql`, `df_session_free`,
   `df_string_free`) plus extension registration
-  (`df_session_register_table`, `df_session_register_scalar_udf`).
+  (`df_session_register_table`, `df_session_register_scalar_udf`,
+  `df_session_register_catalog`).
 - **Callbacks are fixed Go-exported symbols**, not function-pointer
   vtables: the Rust staticlib references `go_table_schema`,
-  `go_table_scan`, `go_table_release`, `go_scalar_udf_invoke`, and
-  `go_scalar_udf_release`, resolved when the final Go binary is linked.
-  Each registration carries an opaque `cgo.Handle` identifying the Go
+  `go_table_scan`, `go_table_release`, `go_scalar_udf_invoke`,
+  `go_scalar_udf_release`, and the catalog/schema equivalents
+  (`go_catalog_schema_names`, `go_catalog_schema_lookup`,
+  `go_catalog_release`, `go_schema_table_names`, `go_schema_table_lookup`,
+  `go_schema_release`), resolved when the final Go binary is linked. Each
+  registration carries an opaque `cgo.Handle` identifying the Go
   implementation.
 - **Results cross as an Arrow C Stream**, imported into a standard
   `array.RecordReader` via `arrow-go`'s `cdata` package — zero-copy.
@@ -341,7 +395,7 @@ the full rationale):
 The FFI, memory-ownership, callback, and threading conventions are
 established; later phases build on them:
 
-- Aggregate and window UDFs, catalog providers
+- Aggregate and window UDFs
 - Cancellation (`context.Context`) wiring for scans and queries
 - Planner/optimizer hooks
 - Prebuilt binary distribution (no local Rust toolchain required)
