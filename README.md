@@ -137,6 +137,65 @@ and surface as Go errors without crashing the process.
   no variadic or generic functions, and volatility is fixed to `Volatile`
   (never constant-folded).
 
+## Built-in table providers
+
+Two ready-made `datafusion.TableProvider` implementations ship as separate,
+independently-importable packages — importing the core module never pulls
+in their dependencies:
+
+### `providers/parquet`
+
+Queries a local Parquet file directly:
+
+```go
+import parquetprovider "github.com/cedricziel/datafusion-golang/providers/parquet"
+
+table, err := parquetprovider.NewTableProvider("/path/to/file.parquet")
+if err != nil {
+    log.Fatal(err)
+}
+err = ctx.RegisterTable("people", table)
+```
+
+Construction opens and validates the file up front, caching its Arrow
+schema; a bad or missing path fails immediately rather than at query time.
+Each `Scan` reads every row across all row groups via a fresh file handle,
+so concurrent and repeated scans of the same provider never interfere with
+each other or leak file descriptors.
+
+### `providers/iceberg`
+
+Queries a local-filesystem-backed Apache Iceberg table directly from its
+`metadata.json`, with no catalog service:
+
+```go
+import icebergprovider "github.com/cedricziel/datafusion-golang/providers/iceberg"
+
+table, err := icebergprovider.NewTableProvider(ctx, "/path/to/table/metadata/v1.metadata.json")
+if err != nil {
+    log.Fatal(err)
+}
+err = ctx.RegisterTable("orders", table)
+```
+
+Construction reads the table's current schema; scanning reads the current
+snapshot's data files (no snapshot selection or time travel). As with the
+Parquet provider, each `Scan` is independent and resource-safe under
+concurrent or repeated use.
+
+**Scope boundaries (both providers):** local filesystem only — no S3,
+GCS, or Azure object stores; no Iceberg catalog services (REST/Glue/Hive);
+no filter or projection pushdown (consistent with the `TableProvider`
+contract in general). These are deliberate non-goals, not missing pieces —
+see `openspec/changes/add-parquet-and-iceberg-table-providers/design.md`.
+
+Run the bundled example, which registers both a Parquet- and an
+Iceberg-backed table and joins across them in one query:
+
+```sh
+go run ./examples/parquet-iceberg
+```
+
 ## Architecture
 
 ```
