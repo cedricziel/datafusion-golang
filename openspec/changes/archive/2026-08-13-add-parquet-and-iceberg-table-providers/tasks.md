@@ -29,4 +29,4 @@
 - [x] 4.1 Add an example (extend `examples/extend` or add `examples/parquet-iceberg`) demonstrating both providers registered and queried via SQL
 - [x] 4.2 Update README: document `providers/parquet` and `providers/iceberg`, their scope boundaries (local filesystem only, current snapshot only, no pushdown), and that they're separate importable packages
 - [x] 4.3 Run `make lint && make format`, ensure `go test ./... -race` passes across all packages (including the new ones) and pre-existing tests aren't regressed, ensure clean tree
-- [ ] 4.4 Commit series (semantic commits: dependency setup, Parquet provider, Iceberg provider, example/docs)
+- [x] 4.4 Commit series (semantic commits: dependency setup, Parquet provider, Iceberg provider, example/docs)
