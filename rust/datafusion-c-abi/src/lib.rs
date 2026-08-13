@@ -6,20 +6,30 @@
 //! string (owned by the caller, freed via `df_string_free`) or NULL/0 on
 //! success.
 
+mod ffi;
+mod table;
+mod udf;
+
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatchIterator;
 use datafusion::execution::context::SessionContext;
+use datafusion::logical_expr::ScalarUDF;
 use tokio::runtime::Runtime;
+
+use crate::ffi::{go_scalar_udf_release, go_table_release, struct_fields_from_ffi};
+use crate::table::GoTableProvider;
+use crate::udf::GoScalarUdf;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
-fn runtime() -> &'static Runtime {
+pub(crate) fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -119,6 +129,141 @@ pub unsafe extern "C" fn df_session_sql(
             unsafe { std::ptr::write(out_stream, stream) };
             Ok(())
         })
+    }));
+
+    match result {
+        Ok(Ok(())) => std::ptr::null_mut(),
+        Ok(Err(msg)) => error_to_cstring(msg),
+        Err(payload) => error_to_cstring(panic_message(&payload)),
+    }
+}
+
+/// Registers a Go-implemented table under `name`. `handle` is the opaque
+/// Go-side token; ownership passes to this function on entry. On success
+/// the engine retains it until the session is freed; on failure it is
+/// released via `go_table_release` before returning (see the header
+/// contract). Returns NULL on success or an error string on failure.
+///
+/// # Safety
+/// `session` must be a live handle returned by [`df_session_new`]. `name`
+/// must be a valid NUL-terminated UTF-8 C string. `handle` must be a live
+/// Go `cgo.Handle` value not previously passed to any registration call.
+#[no_mangle]
+pub unsafe extern "C" fn df_session_register_table(
+    session: *mut c_void,
+    name: *const c_char,
+    handle: usize,
+) -> *mut c_char {
+    if session.is_null() {
+        return error_to_cstring("session handle is null");
+    }
+    if name.is_null() {
+        return error_to_cstring("table name is null");
+    }
+
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
+        let ctx = unsafe { &*(session as *const SessionContext) };
+        let name = unsafe { CStr::from_ptr(name) }
+            .to_str()
+            .map_err(|e| format!("table name is not valid UTF-8: {e}"))?;
+
+        let exists = ctx
+            .table_exist(name)
+            .map_err(|e| format!("checking for existing table '{name}': {e}"))?;
+        if exists {
+            unsafe { go_table_release(handle) };
+            return Err(format!("table '{name}' is already registered"));
+        }
+
+        // try_new releases the handle itself on failure; after this point
+        // the provider's Drop impl owns the release.
+        let provider = GoTableProvider::try_new(handle)?;
+        ctx.register_table(name, Arc::new(provider))
+            .map_err(|e| format!("registering table '{name}': {e}"))?;
+        Ok(())
+    }));
+
+    match result {
+        Ok(Ok(())) => std::ptr::null_mut(),
+        Ok(Err(msg)) => error_to_cstring(msg),
+        Err(payload) => error_to_cstring(panic_message(&payload)),
+    }
+}
+
+/// Registers a Go-implemented scalar function under `name`. `arg_types`
+/// is a struct-typed Arrow C Schema whose fields declare the argument
+/// types; `return_type` is a struct-typed Arrow C Schema with exactly one
+/// field. Both schemas are consumed regardless of outcome. `handle`
+/// follows the same ownership contract as [`df_session_register_table`].
+///
+/// # Safety
+/// `session` must be a live handle returned by [`df_session_new`]. `name`
+/// must be a valid NUL-terminated UTF-8 C string. `arg_types` and
+/// `return_type` must point to live, exported Arrow C Schemas; they are
+/// moved out of (left released) by this call. `handle` must be a live Go
+/// `cgo.Handle` value not previously passed to any registration call.
+#[no_mangle]
+pub unsafe extern "C" fn df_session_register_scalar_udf(
+    session: *mut c_void,
+    name: *const c_char,
+    arg_types: *mut FFI_ArrowSchema,
+    return_type: *mut FFI_ArrowSchema,
+    handle: usize,
+) -> *mut c_char {
+    if session.is_null() || name.is_null() || arg_types.is_null() || return_type.is_null() {
+        return error_to_cstring("df_session_register_scalar_udf: null argument");
+    }
+
+    // Take ownership of the schemas immediately (the Arrow C ABI permits
+    // moving the structs) so every path below — success or failure —
+    // releases them exactly once.
+    let arg_schema = unsafe {
+        let s = std::ptr::read(arg_types);
+        std::ptr::write(arg_types, FFI_ArrowSchema::empty());
+        s
+    };
+    let ret_schema = unsafe {
+        let s = std::ptr::read(return_type);
+        std::ptr::write(return_type, FFI_ArrowSchema::empty());
+        s
+    };
+
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
+        let release_and_err = |msg: String| -> Result<(), String> {
+            unsafe { go_scalar_udf_release(handle) };
+            Err(msg)
+        };
+
+        let ctx = unsafe { &*(session as *const SessionContext) };
+        let name = match unsafe { CStr::from_ptr(name) }.to_str() {
+            Ok(name) => name,
+            Err(e) => return release_and_err(format!("function name is not valid UTF-8: {e}")),
+        };
+
+        if ctx.state().scalar_functions().contains_key(name) {
+            return release_and_err(format!("scalar function '{name}' is already registered"));
+        }
+
+        let arg_fields = match struct_fields_from_ffi(&arg_schema) {
+            Ok(fields) => fields,
+            Err(e) => return release_and_err(format!("argument types for '{name}': {e}")),
+        };
+        let ret_fields = match struct_fields_from_ffi(&ret_schema) {
+            Ok(fields) => fields,
+            Err(e) => return release_and_err(format!("return type for '{name}': {e}")),
+        };
+        if ret_fields.len() != 1 {
+            return release_and_err(format!(
+                "return type schema for '{name}' must have exactly one field, got {}",
+                ret_fields.len()
+            ));
+        }
+        let return_type = ret_fields[0].data_type().clone();
+
+        // From here on the GoScalarUdf's Drop impl owns the handle release.
+        let udf = GoScalarUdf::new(name.to_string(), handle, arg_fields, return_type);
+        ctx.register_udf(ScalarUDF::new_from_impl(udf));
+        Ok(())
     }));
 
     match result {
