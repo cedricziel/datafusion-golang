@@ -91,6 +91,46 @@ collect) and releases the reader when the query completes or fails.
 Errors returned mid-scan abort the query and surface as a Go error; the
 session remains usable afterwards.
 
+### Scan pushdown (opt-in)
+
+A provider that also implements `datafusion.PushdownTableProvider` is
+registered with scan pushdown enabled — no separate configuration, the
+capability is detected at `RegisterTable` time:
+
+```go
+type PushdownTableProvider interface {
+    TableProvider
+    ScanWithOptions(ctx context.Context, opts *ScanOptions) (array.RecordReader, error)
+}
+
+type ScanOptions struct {
+    Projection []int  // column indices into the registered schema; nil = all
+    Filters    []Expr // implicit AND; advisory
+    Limit      int64  // advisory fetch hint; -1 = none
+}
+```
+
+The three options have different contracts:
+
+- **Projection is exact**: the returned reader must yield exactly the
+  projected columns, in order — the engine validates the schema and fails
+  the query on a mismatch (`datafusion.ProjectReader` wraps any reader to
+  comply). Projected-away columns never cross the FFI boundary.
+- **Filters are advisory**: the engine re-applies every pushed filter
+  after the scan, so a provider may use them to skip data (row groups,
+  data files), apply them partially, or ignore them — results are
+  identical either way. A provider may omit only rows that cannot satisfy
+  the filters. Filters arrive as a bounded predicate AST
+  (`datafusion.Expr`): column-vs-literal comparisons (`=`, `!=`, `<`,
+  `<=`, `>`, `>=`), `IS [NOT] NULL`, `[NOT] BETWEEN`, `[NOT] IN`, and
+  `AND`/`OR`/`NOT` combinations. Anything else (functions, casts,
+  arithmetic, `LIKE`, ...) is never pushed down and is evaluated by the
+  engine after the scan.
+- **Limit is advisory**: a fetch hint the provider may truncate at or
+  ignore; the engine enforces the query's limit regardless. Because
+  pushed filters are re-applied above the scan, the hint is `-1` whenever
+  the query's `WHERE` clause was pushed down.
+
 ### Scalar UDFs
 
 Build a function with a fixed signature and register it:
@@ -128,8 +168,12 @@ and surface as Go errors without crashing the process.
 - **Lifetime**: the engine holds references to registered implementations
   until `Close()`, which drains in-flight queries first — after `Close`
   returns, your implementation is never invoked again.
-- **No filter or projection pushdown yet**: every scan is a full-table
-  scan; DataFusion filters and projects after the scan.
+- **Pushdown is opt-in**: providers implementing only `TableProvider` get
+  full-table scans, with DataFusion filtering and projecting after the
+  scan. Providers implementing `PushdownTableProvider` receive
+  projection/filters/limit per scan (see "Scan pushdown"); pushed filters
+  are always re-applied by the engine, so correctness never depends on
+  what a provider does with them.
 - **No cancellation yet**: the `context.Context` passed to `Scan` carries
   no deadline or cancellation; a reader that blocks forever hangs its
   query.
@@ -184,10 +228,11 @@ Parquet provider, each `Scan` is independent and resource-safe under
 concurrent or repeated use.
 
 **Scope boundaries (both providers):** local filesystem only — no S3,
-GCS, or Azure object stores; no Iceberg catalog services (REST/Glue/Hive);
-no filter or projection pushdown (consistent with the `TableProvider`
-contract in general). These are deliberate non-goals, not missing pieces —
-see `openspec/changes/add-parquet-and-iceberg-table-providers/design.md`.
+GCS, or Azure object stores; no Iceberg catalog services (REST/Glue/Hive).
+Both providers currently perform full scans: adopting the opt-in scan
+pushdown (Parquet row-group pruning via column statistics, Iceberg
+manifest-level data-file pruning) is planned follow-up work. See
+`openspec/changes/add-parquet-and-iceberg-table-providers/design.md`.
 
 Run the bundled example, which registers both a Parquet- and an
 Iceberg-backed table and joins across them in one query:
@@ -248,7 +293,8 @@ the full rationale):
 The FFI, memory-ownership, callback, and threading conventions are
 established; later phases build on them:
 
-- Filter and projection pushdown into Go table scans
+- Parquet row-group and Iceberg manifest pruning in the built-in
+  providers, via the scan-pushdown options
 - Aggregate and window UDFs, catalog providers
 - Cancellation (`context.Context`) wiring for scans and queries
 - Planner/optimizer hooks
