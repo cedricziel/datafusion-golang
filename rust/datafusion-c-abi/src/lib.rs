@@ -6,6 +6,7 @@
 //! string (owned by the caller, freed via `df_string_free`) or NULL/0 on
 //! success.
 
+mod catalog;
 mod ffi;
 mod pushdown;
 mod table;
@@ -24,7 +25,10 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::ScalarUDF;
 use tokio::runtime::Runtime;
 
-use crate::ffi::{go_scalar_udf_release, go_table_release, struct_fields_from_ffi};
+use crate::catalog::GoCatalogProvider;
+use crate::ffi::{
+    go_catalog_release, go_scalar_udf_release, go_table_release, struct_fields_from_ffi,
+};
 use crate::table::GoTableProvider;
 use crate::udf::GoScalarUdf;
 
@@ -81,7 +85,7 @@ pub unsafe extern "C" fn df_session_new(error_out: *mut *mut c_char) -> *mut c_v
     match result {
         Ok(handle) => handle,
         Err(payload) => {
-            unsafe { write_error_out(error_out, panic_message(&payload)) };
+            unsafe { write_error_out(error_out, panic_message(payload.as_ref())) };
             std::ptr::null_mut()
         }
     }
@@ -135,7 +139,7 @@ pub unsafe extern "C" fn df_session_sql(
     match result {
         Ok(Ok(())) => std::ptr::null_mut(),
         Ok(Err(msg)) => error_to_cstring(msg),
-        Err(payload) => error_to_cstring(panic_message(&payload)),
+        Err(payload) => error_to_cstring(panic_message(payload.as_ref())),
     }
 }
 
@@ -190,7 +194,7 @@ pub unsafe extern "C" fn df_session_register_table(
     match result {
         Ok(Ok(())) => std::ptr::null_mut(),
         Ok(Err(msg)) => error_to_cstring(msg),
-        Err(payload) => error_to_cstring(panic_message(&payload)),
+        Err(payload) => error_to_cstring(panic_message(payload.as_ref())),
     }
 }
 
@@ -273,7 +277,63 @@ pub unsafe extern "C" fn df_session_register_scalar_udf(
     match result {
         Ok(Ok(())) => std::ptr::null_mut(),
         Ok(Err(msg)) => error_to_cstring(msg),
-        Err(payload) => error_to_cstring(panic_message(&payload)),
+        Err(payload) => error_to_cstring(panic_message(payload.as_ref())),
+    }
+}
+
+/// Registers a Go-implemented catalog under `name`, making
+/// `name.schema.table` queryable via SQL. `handle` follows the same
+/// ownership contract as [`df_session_register_table`]: it passes to the
+/// engine on entry, and on a rejected duplicate-name registration the
+/// engine calls `go_catalog_release` before returning.
+///
+/// The engine's default catalog name is not special-cased (design D6): if
+/// `name` equals it, this call replaces the default catalog outright
+/// rather than erroring, and any tables/functions previously registered
+/// via `df_session_register_table`/`df_session_register_scalar_udf`
+/// become unreachable through SQL. Registering under any other name
+/// already in use returns an error and leaves the existing catalog
+/// unchanged. Nothing is fetched from Go during this call (design D3);
+/// schemas and tables are discovered lazily, per query.
+///
+/// # Safety
+/// `session` must be a live handle returned by [`df_session_new`]. `name`
+/// must be a valid NUL-terminated UTF-8 C string. `handle` must be a live
+/// Go `cgo.Handle` value not previously passed to any registration call.
+#[no_mangle]
+pub unsafe extern "C" fn df_session_register_catalog(
+    session: *mut c_void,
+    name: *const c_char,
+    handle: usize,
+) -> *mut c_char {
+    if session.is_null() {
+        return error_to_cstring("session handle is null");
+    }
+    if name.is_null() {
+        return error_to_cstring("catalog name is null");
+    }
+
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
+        let ctx = unsafe { &*(session as *const SessionContext) };
+        let name = unsafe { CStr::from_ptr(name) }
+            .to_str()
+            .map_err(|e| format!("catalog name is not valid UTF-8: {e}"))?;
+
+        let default_catalog = ctx.state().config_options().catalog.default_catalog.clone();
+        if name != default_catalog && ctx.catalog(name).is_some() {
+            unsafe { go_catalog_release(handle) };
+            return Err(format!("catalog '{name}' is already registered"));
+        }
+
+        let provider = GoCatalogProvider::new(handle);
+        ctx.register_catalog(name, Arc::new(provider));
+        Ok(())
+    }));
+
+    match result {
+        Ok(Ok(())) => std::ptr::null_mut(),
+        Ok(Err(msg)) => error_to_cstring(msg),
+        Err(payload) => error_to_cstring(panic_message(payload.as_ref())),
     }
 }
 
