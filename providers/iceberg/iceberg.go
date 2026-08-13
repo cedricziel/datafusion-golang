@@ -17,21 +17,40 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/iceberg-go/catalog"
 	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/cedricziel/datafusion-golang/datafusion"
 )
 
-// tableProvider is a datafusion.TableProvider backed by a local Iceberg
-// table's metadata.json location. Each Scan re-opens the table and starts
-// a fresh scan so concurrent and repeated scans never share state (design
-// D4), mirroring providers/parquet.
+// tableProvider is a datafusion.TableProvider backed by an Iceberg table,
+// opened either from a direct metadata.json location or through a catalog
+// client. Each Scan calls load to obtain a fresh table handle and starts a
+// fresh scan so concurrent and repeated scans never share state (design
+// D4 of add-parquet-and-iceberg-table-providers), mirroring
+// providers/parquet.
 type tableProvider struct {
-	metadataLocation string
-	schema           *arrow.Schema
+	schema   *arrow.Schema
+	load     func(ctx context.Context) (*table.Table, error)
+	describe func() string // for error messages, e.g. "metadata.json at ..." or "catalog table db.orders"
+}
+
+func newProvider(ctx context.Context, load func(context.Context) (*table.Table, error), describe func() string) (datafusion.TableProvider, error) {
+	tbl, err := load(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	schema, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	if err != nil {
+		return nil, fmt.Errorf("iceberg: derive arrow schema of %s: %w", describe(), err)
+	}
+
+	return &tableProvider{schema: schema, load: load, describe: describe}, nil
 }
 
 // NewTableProvider opens the Iceberg table whose current metadata lives at
@@ -39,28 +58,44 @@ type tableProvider struct {
 // current schema. Construction fails if the metadata cannot be read or
 // parsed as valid Iceberg table metadata.
 func NewTableProvider(ctx context.Context, metadataLocation string) (datafusion.TableProvider, error) {
-	tbl, err := loadTable(ctx, metadataLocation)
-	if err != nil {
-		return nil, err
+	load := func(ctx context.Context) (*table.Table, error) {
+		return loadTableFromLocation(ctx, metadataLocation)
 	}
+	return newProvider(ctx, load, func() string { return metadataLocation })
+}
 
-	schema, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
-	if err != nil {
-		return nil, fmt.Errorf("iceberg: derive arrow schema of %s: %w", metadataLocation, err)
+// NewTableProviderFromCatalog resolves and opens the Iceberg table
+// identified by identifier (namespace levels followed by the table name,
+// e.g. "db", "orders") through cat, an already-configured Iceberg catalog
+// client. providers/iceberg depends only on the catalog.Catalog interface,
+// never a specific catalog implementation — the caller builds and
+// configures whichever concrete client (REST, Hive, Glue, SQL, Hadoop, ...)
+// it needs.
+//
+// Unlike NewTableProvider, a provider constructed this way re-resolves the
+// table through the catalog on every scan, so a commit made to the table
+// between two scans becomes visible without reconstructing the provider.
+func NewTableProviderFromCatalog(ctx context.Context, cat catalog.Catalog, identifier ...string) (datafusion.TableProvider, error) {
+	ident := table.Identifier(identifier)
+	load := func(ctx context.Context) (*table.Table, error) {
+		tbl, err := cat.LoadTable(ctx, ident)
+		if err != nil {
+			return nil, fmt.Errorf("iceberg: load catalog table %s: %w", strings.Join(identifier, "."), err)
+		}
+		return tbl, nil
 	}
-
-	return &tableProvider{metadataLocation: metadataLocation, schema: schema}, nil
+	return newProvider(ctx, load, func() string { return "catalog table " + strings.Join(identifier, ".") })
 }
 
 func (t *tableProvider) Schema() *arrow.Schema { return t.schema }
 
-// Scan opens a fresh table handle and scan over the table's current
-// snapshot, independent of any other concurrent or subsequent scan of the
-// same provider (design D4). Errors encountered while reading a data file
-// surface lazily through the returned reader's Err(), not swallowed
-// (design D5).
+// Scan calls load to obtain a fresh table handle and scan over the table's
+// current snapshot, independent of any other concurrent or subsequent scan
+// of the same provider (design D4). Errors encountered while reading a
+// data file surface lazily through the returned reader's Err(), not
+// swallowed (design D5).
 func (t *tableProvider) Scan(ctx context.Context) (array.RecordReader, error) {
-	tbl, err := loadTable(ctx, t.metadataLocation)
+	tbl, err := t.load(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -68,17 +103,18 @@ func (t *tableProvider) Scan(ctx context.Context) (array.RecordReader, error) {
 	scan := tbl.Scan()
 	schema, itr, err := scan.ToArrowRecords(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("iceberg: scan %s: %w", t.metadataLocation, err)
+		return nil, fmt.Errorf("iceberg: scan %s: %w", t.describe(), err)
 	}
 
 	return readerFromSeq(schema, itr), nil
 }
 
-// loadTable loads the Iceberg table at metadataLocation with no catalog
-// service (design D3). The identifier is not validated against the
-// metadata content by iceberg-go; it is only used for display purposes, so
-// a name derived from the metadata path is fine here.
-func loadTable(ctx context.Context, metadataLocation string) (*table.Table, error) {
+// loadTableFromLocation loads the Iceberg table at metadataLocation with
+// no catalog service (design D3 of add-parquet-and-iceberg-table-providers).
+// The identifier is not validated against the metadata content by
+// iceberg-go; it is only used for display purposes, so a name derived from
+// the metadata path is fine here.
+func loadTableFromLocation(ctx context.Context, metadataLocation string) (*table.Table, error) {
 	fsysF := icebergio.LoadFSFunc(nil, metadataLocation)
 	ident := table.Identifier{"default", tableNameFromMetadataLocation(metadataLocation)}
 	tbl, err := table.NewFromLocation(ctx, ident, metadataLocation, fsysF, nil)

@@ -23,7 +23,7 @@ func (t *tableProvider) ScanWithOptions(ctx context.Context, opts *datafusion.Sc
 		return t.Scan(ctx)
 	}
 
-	tbl, err := loadTable(ctx, t.metadataLocation)
+	tbl, err := t.load(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +56,7 @@ func (t *tableProvider) ScanWithOptions(ctx context.Context, opts *datafusion.Sc
 	scan := tbl.Scan(scanOpts...)
 	schema, itr, err := scan.ToArrowRecords(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("iceberg: scan %s: %w", t.metadataLocation, err)
+		return nil, fmt.Errorf("iceberg: scan %s: %w", t.describe(), err)
 	}
 	reader := readerFromSeq(schema, itr)
 	if perm != nil {
@@ -79,7 +79,7 @@ func (t *tableProvider) projectionPlan(projection []int) (names []string, perm [
 	seen := make(map[int]bool, len(projection))
 	for _, idx := range projection {
 		if idx < 0 || idx >= t.schema.NumFields() {
-			return nil, nil, fmt.Errorf("iceberg: projection index %d out of range for %s", idx, t.metadataLocation)
+			return nil, nil, fmt.Errorf("iceberg: projection index %d out of range for %s", idx, t.describe())
 		}
 		if !seen[idx] {
 			seen[idx] = true

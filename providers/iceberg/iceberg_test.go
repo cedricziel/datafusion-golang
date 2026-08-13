@@ -13,6 +13,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/hadoop"
 	icebergtable "github.com/apache/iceberg-go/table"
 	"github.com/cedricziel/datafusion-golang/datafusion"
@@ -35,21 +36,24 @@ func peopleBatch(t *testing.T, schema *arrow.Schema, ids []int64, names []string
 	return b.NewRecordBatch()
 }
 
-// newIcebergFixture creates a real local-filesystem Iceberg table (via
-// iceberg-go's own Hadoop catalog and write path, no hand-authored
+// newIcebergCatalogFixture creates a real local-filesystem Iceberg table
+// (via iceberg-go's own Hadoop catalog and write path, no hand-authored
 // metadata) with one Append per batch, so batches map onto separate data
-// files in the current snapshot. It returns the metadata.json location of
-// the resulting table.
-func newIcebergFixture(t *testing.T, tableName string, schema *arrow.Schema, batches ...arrow.RecordBatch) string {
+// files in the current snapshot. It returns the catalog itself and the
+// table's namespace-qualified identifier, so tests can exercise either the
+// metadata.json path (via cat.LoadTable(...).MetadataLocation()) or the
+// catalog.Catalog path (NewTableProviderFromCatalog) against the same
+// fixture.
+func newIcebergCatalogFixture(t *testing.T, tableName string, schema *arrow.Schema, batches ...arrow.RecordBatch) (cat catalog.Catalog, identifier []string) {
 	t.Helper()
 	ctx := context.Background()
 
 	warehouse := t.TempDir()
-	cat, err := hadoop.NewCatalog("test", warehouse, nil)
+	hcat, err := hadoop.NewCatalog("test", warehouse, nil)
 	if err != nil {
 		t.Fatalf("hadoop.NewCatalog: %v", err)
 	}
-	if err := cat.CreateNamespace(ctx, []string{"default"}, nil); err != nil {
+	if err := hcat.CreateNamespace(ctx, []string{"default"}, nil); err != nil {
 		t.Fatalf("CreateNamespace: %v", err)
 	}
 
@@ -58,7 +62,8 @@ func newIcebergFixture(t *testing.T, tableName string, schema *arrow.Schema, bat
 		t.Fatalf("ArrowSchemaToIcebergWithFreshIDs: %v", err)
 	}
 
-	tbl, err := cat.CreateTable(ctx, []string{"default", tableName}, icebergSchema)
+	ident := []string{"default", tableName}
+	tbl, err := hcat.CreateTable(ctx, ident, icebergSchema)
 	if err != nil {
 		t.Fatalf("CreateTable: %v", err)
 	}
@@ -77,6 +82,18 @@ func newIcebergFixture(t *testing.T, tableName string, schema *arrow.Schema, bat
 		tbl = next
 	}
 
+	return hcat, ident
+}
+
+// newIcebergFixture is newIcebergCatalogFixture for callers that only need
+// a metadata.json location (the direct-path construction tests).
+func newIcebergFixture(t *testing.T, tableName string, schema *arrow.Schema, batches ...arrow.RecordBatch) string {
+	t.Helper()
+	cat, ident := newIcebergCatalogFixture(t, tableName, schema, batches...)
+	tbl, err := cat.LoadTable(context.Background(), ident)
+	if err != nil {
+		t.Fatalf("LoadTable: %v", err)
+	}
 	return tbl.MetadataLocation()
 }
 
