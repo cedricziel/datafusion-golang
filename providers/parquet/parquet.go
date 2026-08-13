@@ -1,6 +1,16 @@
 // Package parquet provides a datafusion.TableProvider backed by a local
 // Parquet file, so it can be registered on a SessionContext and queried via
 // SQL with no hand-written Parquet-reading code.
+//
+// The provider implements datafusion.PushdownTableProvider, so it is
+// registered with scan pushdown enabled: projections prune column
+// decoding exactly, pushed filters skip row groups whose column
+// statistics or bloom filters prove no row can match, and the limit hint
+// truncates the scan. Pushed filters are strictly advisory per the
+// table-provider contract — they are used only to omit rows that cannot
+// satisfy them (the engine re-applies every filter), and any missing or
+// inconclusive metadata keeps the data, so results are identical with and
+// without pruning.
 package parquet
 
 import (
