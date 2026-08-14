@@ -31,7 +31,16 @@ type ScalarUDF interface {
 	// are looked up lowercase, so use a lowercase name unless callers
 	// will quote it.
 	Name() string
-	// ArgTypes declares the argument types, in order.
+	// ArgTypes declares the argument types, in order. For a nested type
+	// (List/Struct/Map) argument that will be called with a column from a
+	// registered table, declare it as that table's own Schema().Field(i).Type
+	// rather than building an equivalent type independently: the engine's
+	// function-signature match is exact, including field metadata, and a
+	// Parquet- or Iceberg-backed table's registered schema carries
+	// per-field metadata (e.g. Parquet field IDs) that a type built fresh
+	// in Go won't have — an otherwise-identical declared type then fails
+	// planning with "No function matches the given name and argument
+	// types" instead of matching structurally.
 	ArgTypes() []arrow.DataType
 	// ReturnType declares the result type.
 	ReturnType() arrow.DataType
