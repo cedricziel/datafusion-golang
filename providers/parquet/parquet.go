@@ -16,6 +16,7 @@ package parquet
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -33,6 +34,11 @@ var readProps = pqarrow.ArrowReadProperties{BatchSize: 1024}
 type tableProvider struct {
 	path   string
 	schema *arrow.Schema
+
+	// insertMu serializes InsertInto calls against this instance so two
+	// concurrent inserts can never race the rewrite-then-rename commit
+	// (design D7 of wire-parquet-and-iceberg-insert). Scans never take it.
+	insertMu sync.Mutex
 }
 
 // NewTableProvider opens the Parquet file at path, validating it and
