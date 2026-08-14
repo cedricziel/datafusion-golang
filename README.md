@@ -206,12 +206,55 @@ registered via `RegisterTable`/`RegisterScalarUDF` become unreachable
 through SQL as a result. Registering under any other name already in use
 returns an error and leaves the existing catalog unchanged.
 
+### Writable tables
+
+A registered table can accept `INSERT INTO`, `INSERT OVERWRITE`, and
+`REPLACE INTO` by implementing an optional interface alongside
+`TableProvider`, the same opt-in shape scan pushdown uses:
+
+```go
+type WritableTableProvider interface {
+    TableProvider
+    InsertInto(ctx context.Context, op InsertOp, rows array.RecordReader) (uint64, error)
+}
+```
+
+`InsertInto` receives the statement's input already planned by the
+engine — an explicit column list resolved and reordered, omitted columns
+filled with their default or `NULL`, every value cast to the registered
+column type — so the incoming `rows` always matches the table's schema
+exactly, regardless of what the `INSERT` statement wrote. `op` is one of
+`InsertAppend` (`INSERT INTO`), `InsertOverwrite` (`INSERT OVERWRITE`), or
+`InsertReplace` (`REPLACE INTO`); a provider that doesn't support a given
+mode returns an error for it — the engine has no opinion about which
+modes a table supports.
+
+`InsertInto` is called at most once per statement and must commit or roll
+back before returning: the engine delivers the row stream exactly once
+and never retries. The returned count becomes the statement's DML result
+(`SELECT count` — a single `UInt64` row), used verbatim and not
+cross-checked by the engine, since only the provider knows what "written"
+means for its own write semantics (a dedup or replace path may legitimately
+report fewer rows than it consumed). Providers implementing only
+`TableProvider` (or `PushdownTableProvider`) are unaffected: `INSERT`
+against them fails with a clear "does not support INSERT" error, and
+reads are untouched.
+
+```go
+err := ctx.RegisterTable("events", table) // table also implements WritableTableProvider
+reader, err := ctx.SQL("INSERT INTO events VALUES (1, 'signed_up')")
+```
+
+`providers/parquet` and `providers/iceberg` do not yet implement this
+interface — see [Roadmap](#roadmap).
+
 ### Contracts and limitations
 
 - **Goroutine safety is on you**: like an `http.Handler`, a registered
-  `TableProvider`, `ScalarUDF`, or `CatalogProvider`/`SchemaProvider` may
-  be invoked from multiple engine-internal threads concurrently and must
-  be safe for concurrent use.
+  `TableProvider`, `WritableTableProvider`, `ScalarUDF`, or
+  `CatalogProvider`/`SchemaProvider` may be invoked from multiple
+  engine-internal threads concurrently and must be safe for concurrent
+  use.
 - **Duplicate names are rejected**: registering a table, function, or
   (non-default) catalog name already in use (including built-in function
   names) returns an error and leaves the existing registration unchanged.
@@ -369,9 +412,9 @@ the full rationale):
   `df_session_register_catalog`).
 - **Callbacks are fixed Go-exported symbols**, not function-pointer
   vtables: the Rust staticlib references `go_table_schema`,
-  `go_table_scan`, `go_table_release`, `go_scalar_udf_invoke`,
-  `go_scalar_udf_release`, and the catalog/schema equivalents
-  (`go_catalog_schema_names`, `go_catalog_schema_lookup`,
+  `go_table_scan`, `go_table_release`, `go_table_insert`,
+  `go_scalar_udf_invoke`, `go_scalar_udf_release`, and the catalog/schema
+  equivalents (`go_catalog_schema_names`, `go_catalog_schema_lookup`,
   `go_catalog_release`, `go_schema_table_names`, `go_schema_table_lookup`,
   `go_schema_release`), resolved when the final Go binary is linked. Each
   registration carries an opaque `cgo.Handle` identifying the Go
@@ -396,6 +439,7 @@ The FFI, memory-ownership, callback, and threading conventions are
 established; later phases build on them:
 
 - Aggregate and window UDFs
+- Writable `providers/parquet` and `providers/iceberg` (the engine-level `WritableTableProvider` capability already exists; wiring the two built-in providers to it is planned follow-up work)
 - Cancellation (`context.Context`) wiring for scans and queries
 - Planner/optimizer hooks
 - Prebuilt binary distribution (no local Rust toolchain required)
