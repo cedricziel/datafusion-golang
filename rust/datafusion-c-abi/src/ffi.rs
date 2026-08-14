@@ -28,6 +28,13 @@ extern "C" {
         error_out: *mut *mut c_char,
     );
     pub(crate) fn go_table_release(handle: usize);
+    pub(crate) fn go_table_insert(
+        handle: usize,
+        in_stream: *mut FFI_ArrowArrayStream,
+        insert_op: i32,
+        rows_out: *mut u64,
+        error_out: *mut *mut c_char,
+    );
     pub(crate) fn go_scalar_udf_invoke(
         handle: usize,
         args_array: *mut FFI_ArrowArray,
@@ -179,6 +186,19 @@ pub(crate) mod tests {
     /// pushdown table violating the projection contract).
     pub const TABLE_PUSHDOWN_WRONG_SCHEMA: usize = 8;
 
+    // Insert-kind stub behavior (add-table-provider-insert), selected by
+    // `handle % 10` independently of the table/UDF digit above — a
+    // different trampoline (go_table_insert), so its own values don't
+    // need to differ from TABLE_*/UDF_*'s. One exception: registering any
+    // table (insert-capable or not) always calls go_table_schema first,
+    // so an insert-kind value must avoid TABLE_SCHEMA_ERR (3) or
+    // registration itself would fail before go_table_insert is ever
+    // reached.
+    pub const INSERT_OK: usize = 1;
+    pub const INSERT_ERR_IMMEDIATE: usize = 2;
+    pub const INSERT_APPEND_ONLY: usize = 4;
+    pub const INSERT_ERR_MIDSTREAM: usize = 5;
+
     // Catalog- and schema-kind stub behavior (add-catalog-provider).
     // `catalog::tests::handle(catalog_kind, schema_kind, unique)` packs all
     // three fields into one outer-test handle value, since
@@ -215,6 +235,29 @@ pub(crate) mod tests {
     /// go_table_scan received without re-deriving the packing scheme.
     pub fn uniqueness_base_of(handle: usize) -> usize {
         (handle / 100) * 100
+    }
+
+    /// What one `go_table_insert` call received, recorded by the stub.
+    #[derive(Debug, Clone)]
+    pub struct InsertRecord {
+        pub handle: usize,
+        pub insert_op: i32,
+        pub rows: Vec<RecordBatch>,
+    }
+
+    fn insert_records_lock() -> &'static Mutex<Vec<InsertRecord>> {
+        static V: OnceLock<Mutex<Vec<InsertRecord>>> = OnceLock::new();
+        V.get_or_init(|| Mutex::new(vec![]))
+    }
+
+    pub fn insert_records_for(handle: usize) -> Vec<InsertRecord> {
+        insert_records_lock()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.handle == handle)
+            .cloned()
+            .collect()
     }
 
     /// What one `go_table_scan` call received, recorded by the stub.
@@ -475,6 +518,81 @@ pub(crate) mod tests {
     #[no_mangle]
     extern "C" fn go_table_release(handle: usize) {
         released_tables_lock().lock().unwrap().push(handle);
+    }
+
+    #[no_mangle]
+    extern "C" fn go_table_insert(
+        handle: usize,
+        in_stream: *mut FFI_ArrowArrayStream,
+        insert_op: i32,
+        rows_out: *mut u64,
+        error_out: *mut *mut c_char,
+    ) {
+        use arrow::ffi_stream::ArrowArrayStreamReader;
+
+        let kind = handle % 10;
+
+        // Ownership of the stream transfers to the callee on entry
+        // regardless of outcome, mirroring the real contract.
+        let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut *in_stream) };
+
+        if kind == INSERT_ERR_IMMEDIATE {
+            drop(reader);
+            unsafe { write_malloc_error(error_out, "insert failed immediately (stub)") };
+            return;
+        }
+        if kind == INSERT_APPEND_ONLY && insert_op != 0 {
+            drop(reader);
+            unsafe { write_malloc_error(error_out, "only Append is supported (stub)") };
+            return;
+        }
+
+        let mut reader = match reader {
+            Ok(r) => r,
+            Err(e) => {
+                unsafe { write_malloc_error(error_out, &format!("importing insert stream: {e}")) };
+                return;
+            }
+        };
+
+        let mut batches = Vec::new();
+        let mut total_rows: u64 = 0;
+        let mut mid_error = false;
+        for item in &mut reader {
+            match item {
+                Ok(batch) => {
+                    total_rows += batch.num_rows() as u64;
+                    batches.push(batch);
+                    if kind == INSERT_ERR_MIDSTREAM && batches.len() == 1 {
+                        mid_error = true;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    insert_records_lock().lock().unwrap().push(InsertRecord {
+                        handle,
+                        insert_op,
+                        rows: batches,
+                    });
+                    unsafe {
+                        write_malloc_error(error_out, &format!("reading insert stream: {e}"))
+                    };
+                    return;
+                }
+            }
+        }
+        insert_records_lock().lock().unwrap().push(InsertRecord {
+            handle,
+            insert_op,
+            rows: batches,
+        });
+
+        if mid_error {
+            unsafe { write_malloc_error(error_out, "insert failed mid-stream (stub)") };
+            return;
+        }
+
+        unsafe { *rows_out = total_rows };
     }
 
     #[no_mangle]

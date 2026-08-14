@@ -97,12 +97,18 @@ char *df_session_sql(df_session_t session, const char *sql, struct ArrowArrayStr
  * clear, every go_table_scan call carries the no-pushdown sentinels and
  * the engine projects and filters after the scan, exactly as before.
  *
+ * `supports_insert` (0 or 1) declares whether the provider accepts
+ * INSERT INTO / INSERT OVERWRITE / REPLACE INTO: when set, the engine
+ * delivers the statement's planned input rows to go_table_insert; when
+ * clear, an INSERT against this table fails with a "does not support
+ * INSERT" query error without any FFI call.
+ *
  * The table's schema is fetched exactly once, via go_table_schema, during
  * this call. Returns NULL on success, or an error string (freed via
  * df_string_free) on failure.
  */
 char *df_session_register_table(df_session_t session, const char *name, uintptr_t handle,
-                                uint8_t supports_pushdown);
+                                uint8_t supports_pushdown, uint8_t supports_insert);
 
 /*
  * Register a Go-implemented scalar function under the given name.
@@ -212,6 +218,19 @@ void df_string_free(char *s);
  * out-params untouched.
  *
  * go_schema_release: drop the Go-side schema handle.
+ *
+ * go_table_insert: deliver one INSERT statement's planned input rows to
+ * a provider registered with supports_insert set. Ownership of in_stream
+ * transfers to the callee on entry — the reverse of go_table_scan, where
+ * Go produces the stream; here Rust produces it and Go consumes it,
+ * releasing it when done regardless of outcome. insert_op is 0 (Append,
+ * SQL INSERT INTO), 1 (Overwrite, INSERT OVERWRITE), or 2 (Replace,
+ * REPLACE INTO); a provider that doesn't support a given mode returns an
+ * error for it. Called at most once per statement; the callee must
+ * commit or roll back before returning. On success *rows_out is the
+ * number of rows the callee reports written (used verbatim as the
+ * statement's DML result count, not cross-checked by the engine); on
+ * failure *error_out is set and *rows_out is left untouched.
  */
 extern void go_table_schema(uintptr_t handle, struct ArrowSchema *out_schema, char **error_out);
 /*
@@ -222,6 +241,8 @@ extern void go_table_scan(uintptr_t handle, int32_t *projection, intptr_t projec
                           char *filters_json, int64_t limit,
                           struct ArrowArrayStream *out_stream, char **error_out);
 extern void go_table_release(uintptr_t handle);
+extern void go_table_insert(uintptr_t handle, struct ArrowArrayStream *in_stream,
+                            int32_t insert_op, uint64_t *rows_out, char **error_out);
 extern void go_scalar_udf_invoke(uintptr_t handle, struct ArrowArray *args_array,
                                  struct ArrowSchema *args_schema, struct ArrowArray *out_array,
                                  struct ArrowSchema *out_schema, char **error_out);
