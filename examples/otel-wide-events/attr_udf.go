@@ -18,31 +18,99 @@ import (
 //
 // attrsType must be the wide_events table's actual, registered attributes
 // field type (e.g. events.Schema().Field(3).Type), not an independently
-// built arrow.MapOf(...): DataFusion's function-signature matching is an
-// exact type match, and a Parquet-backed table's registered schema
-// carries PARQUET:field_id metadata on every nested field that a type
-// built fresh in Go won't have, so a mismatched declared argument type
-// fails planning with "No function matches the given name and argument
-// types" even though the types are structurally identical.
+// built arrow.MapOf(...) — see datafusion.ScalarUDF.ArgTypes's doc for
+// why a declared argument type has to come from the table's own schema
+// when it's a nested (List/Struct/Map) type read from a Parquet- or
+// Iceberg-backed table.
 //
 // Only the 5 scalar variants get a UDF (array_value/kvlist_value are out
 // of scope here): their return type would itself be List<Struct<...>>,
 // and demonstrating the capability doesn't need every variant covered
 // twice — httpEventsView already covers all 7.
 func registerAttrUDFs(sess *datafusion.SessionContext, attrsType arrow.DataType) error {
-	udfs := []datafusion.ScalarUDF{
-		newOtelAttrStringUDF("otel_attr_string", 0, attrsType),
-		newOtelAttrBoolUDF("otel_attr_bool", 1, attrsType),
-		newOtelAttrIntUDF("otel_attr_int", 2, attrsType),
-		newOtelAttrDoubleUDF("otel_attr_double", 3, attrsType),
-		newOtelAttrBytesUDF("otel_attr_bytes", 4, attrsType),
+	udfs := []func() (datafusion.ScalarUDF, error){
+		func() (datafusion.ScalarUDF, error) {
+			return newOtelAttrUDF("otel_attr_string", 0, attrsType, arrow.BinaryTypes.String,
+				func(items *array.Struct, i int) *array.String { return items.Field(i).(*array.String) },
+				func() *array.StringBuilder { return array.NewStringBuilder(memory.DefaultAllocator) })
+		},
+		func() (datafusion.ScalarUDF, error) {
+			return newOtelAttrUDF("otel_attr_bool", 1, attrsType, arrow.FixedWidthTypes.Boolean,
+				func(items *array.Struct, i int) *array.Boolean { return items.Field(i).(*array.Boolean) },
+				func() *array.BooleanBuilder { return array.NewBooleanBuilder(memory.DefaultAllocator) })
+		},
+		func() (datafusion.ScalarUDF, error) {
+			return newOtelAttrUDF("otel_attr_int", 2, attrsType, arrow.PrimitiveTypes.Int64,
+				func(items *array.Struct, i int) *array.Int64 { return items.Field(i).(*array.Int64) },
+				func() *array.Int64Builder { return array.NewInt64Builder(memory.DefaultAllocator) })
+		},
+		func() (datafusion.ScalarUDF, error) {
+			return newOtelAttrUDF("otel_attr_double", 3, attrsType, arrow.PrimitiveTypes.Float64,
+				func(items *array.Struct, i int) *array.Float64 { return items.Field(i).(*array.Float64) },
+				func() *array.Float64Builder { return array.NewFloat64Builder(memory.DefaultAllocator) })
+		},
+		func() (datafusion.ScalarUDF, error) {
+			return newOtelAttrUDF("otel_attr_bytes", 4, attrsType, arrow.BinaryTypes.Binary,
+				func(items *array.Struct, i int) *array.Binary { return items.Field(i).(*array.Binary) },
+				func() *array.BinaryBuilder {
+					return array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+				})
+		},
 	}
-	for _, udf := range udfs {
+	for _, build := range udfs {
+		udf, err := build()
+		if err != nil {
+			return err
+		}
 		if err := sess.RegisterScalarUDF(udf); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// valueCol and valueBuilder are the common shape every anyValueType
+// scalar column (string_value, bool_value, ...) and its matching Arrow
+// builder already have — enough to write newOtelAttrUDF once instead of
+// once per variant.
+type valueCol[V any] interface {
+	IsNull(i int) bool
+	Value(i int) V
+}
+
+type valueBuilder[V any] interface {
+	Append(V)
+	AppendNull()
+	NewArray() arrow.Array
+}
+
+// newOtelAttrUDF builds one otel_attr_* function via the core
+// datafusion.NewScalarUDF constructor (datafusion/udf.go) — this needs no
+// custom ScalarUDF implementation, matching how examples/extend builds
+// its scalar UDFs. col selects which typed field of the matched
+// attribute's AnyValue struct to read (see anyValueType's field layout);
+// newBuilder constructs a fresh builder of the matching type per call.
+func newOtelAttrUDF[V any, C valueCol[V], B valueBuilder[V]](
+	name string, fieldIndex int, attrsType, returnType arrow.DataType,
+	col func(items *array.Struct, fieldIndex int) C, newBuilder func() B,
+) (datafusion.ScalarUDF, error) {
+	return datafusion.NewScalarUDF(name, []arrow.DataType{attrsType, arrow.BinaryTypes.String}, returnType,
+		func(args []arrow.Array) (arrow.Array, error) {
+			attrs := args[0].(*array.Map)
+			keys := args[1].(*array.String)
+			items := attrs.Items().(*array.Struct)
+			c := col(items, fieldIndex)
+
+			b := newBuilder()
+			for _, idx := range findAttrItemIndex(attrs, keys) {
+				if idx < 0 || items.IsNull(idx) || c.IsNull(idx) {
+					b.AppendNull()
+					continue
+				}
+				b.Append(c.Value(idx))
+			}
+			return b.NewArray(), nil
+		})
 }
 
 // findAttrItemIndex returns, for each row i, the index into attrs.Items()
@@ -66,124 +134,4 @@ func findAttrItemIndex(attrs *array.Map, keys *array.String) []int {
 		}
 	}
 	return out
-}
-
-// otelAttrUDF is the shared shape of every otel_attr_* function: (Map
-// attributes, Utf8 key) -> one scalar column, extracted by matching key
-// against the map and reading one field of the matched entry's AnyValue
-// struct. Only extract differs per variant (which typed column of
-// anyValueType's fields 0-4 it reads and appends into).
-type otelAttrUDF struct {
-	name       string
-	attrsType  arrow.DataType
-	returnType arrow.DataType
-	extract    func(items *array.Struct, matched []int) arrow.Array
-}
-
-func (u otelAttrUDF) Name() string { return u.name }
-func (u otelAttrUDF) ArgTypes() []arrow.DataType {
-	return []arrow.DataType{u.attrsType, arrow.BinaryTypes.String}
-}
-func (u otelAttrUDF) ReturnType() arrow.DataType { return u.returnType }
-
-func (u otelAttrUDF) Evaluate(args []arrow.Array) (arrow.Array, error) {
-	attrs := args[0].(*array.Map)
-	keys := args[1].(*array.String)
-	items := attrs.Items().(*array.Struct)
-	return u.extract(items, findAttrItemIndex(attrs, keys)), nil
-}
-
-func newOtelAttrStringUDF(name string, fieldIndex int, attrsType arrow.DataType) datafusion.ScalarUDF {
-	return otelAttrUDF{
-		name: name, attrsType: attrsType, returnType: arrow.BinaryTypes.String,
-		extract: func(items *array.Struct, matched []int) arrow.Array {
-			col := items.Field(fieldIndex).(*array.String)
-			b := array.NewStringBuilder(memory.DefaultAllocator)
-			defer b.Release()
-			for _, idx := range matched {
-				if idx < 0 || items.IsNull(idx) || col.IsNull(idx) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(col.Value(idx))
-			}
-			return b.NewArray()
-		},
-	}
-}
-
-func newOtelAttrBoolUDF(name string, fieldIndex int, attrsType arrow.DataType) datafusion.ScalarUDF {
-	return otelAttrUDF{
-		name: name, attrsType: attrsType, returnType: arrow.FixedWidthTypes.Boolean,
-		extract: func(items *array.Struct, matched []int) arrow.Array {
-			col := items.Field(fieldIndex).(*array.Boolean)
-			b := array.NewBooleanBuilder(memory.DefaultAllocator)
-			defer b.Release()
-			for _, idx := range matched {
-				if idx < 0 || items.IsNull(idx) || col.IsNull(idx) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(col.Value(idx))
-			}
-			return b.NewArray()
-		},
-	}
-}
-
-func newOtelAttrIntUDF(name string, fieldIndex int, attrsType arrow.DataType) datafusion.ScalarUDF {
-	return otelAttrUDF{
-		name: name, attrsType: attrsType, returnType: arrow.PrimitiveTypes.Int64,
-		extract: func(items *array.Struct, matched []int) arrow.Array {
-			col := items.Field(fieldIndex).(*array.Int64)
-			b := array.NewInt64Builder(memory.DefaultAllocator)
-			defer b.Release()
-			for _, idx := range matched {
-				if idx < 0 || items.IsNull(idx) || col.IsNull(idx) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(col.Value(idx))
-			}
-			return b.NewArray()
-		},
-	}
-}
-
-func newOtelAttrDoubleUDF(name string, fieldIndex int, attrsType arrow.DataType) datafusion.ScalarUDF {
-	return otelAttrUDF{
-		name: name, attrsType: attrsType, returnType: arrow.PrimitiveTypes.Float64,
-		extract: func(items *array.Struct, matched []int) arrow.Array {
-			col := items.Field(fieldIndex).(*array.Float64)
-			b := array.NewFloat64Builder(memory.DefaultAllocator)
-			defer b.Release()
-			for _, idx := range matched {
-				if idx < 0 || items.IsNull(idx) || col.IsNull(idx) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(col.Value(idx))
-			}
-			return b.NewArray()
-		},
-	}
-}
-
-func newOtelAttrBytesUDF(name string, fieldIndex int, attrsType arrow.DataType) datafusion.ScalarUDF {
-	return otelAttrUDF{
-		name: name, attrsType: attrsType, returnType: arrow.BinaryTypes.Binary,
-		extract: func(items *array.Struct, matched []int) arrow.Array {
-			col := items.Field(fieldIndex).(*array.Binary)
-			b := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
-			defer b.Release()
-			for _, idx := range matched {
-				if idx < 0 || items.IsNull(idx) || col.IsNull(idx) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(col.Value(idx))
-			}
-			return b.NewArray()
-		},
-	}
 }
