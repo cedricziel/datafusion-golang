@@ -13,6 +13,6 @@
 
 ## 3. Finish
 
-- [ ] 3.1 Update the package doc comment to reflect whichever encoding and extraction approach(es) ship, including the D1 negative-result note if applicable
-- [ ] 3.2 `make lint && make format`, run `go run ./examples/otel-wide-events`, confirm output is correct
-- [ ] 3.3 `/simplify` pass if the diff size warrants it
+- [x] 3.1 Update the package doc comment to reflect whichever encoding and extraction approach(es) ship, including the D1 negative-result note if applicable
+- [x] 3.2 `make lint && make format`, run `go run ./examples/otel-wide-events`, confirm output is correct
+- [x] 3.3 `/simplify` pass if the diff size warrants it — 3 review agents (reuse, simplification, altitude) found: `otelAttrUDF` duplicated `datafusion.NewScalarUDF`'s already-provided shape (dropped, now built through the constructor directly, matching `examples/extend`'s convention); the 5 per-variant extract loops collapsed into one generic helper; the `PARQUET:field_id` exact-type-match gotcha is general to any nested-type `ScalarUDF` argument, not example-specific, and is now documented in `datafusion/udf.go`. Efficiency review skipped (example code, not a hot path)
