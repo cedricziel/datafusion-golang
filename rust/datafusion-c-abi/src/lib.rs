@@ -148,8 +148,13 @@ pub unsafe extern "C" fn df_session_sql(
 /// the engine retains it until the session is freed; on failure it is
 /// released via `go_table_release` before returning (see the header
 /// contract). `supports_pushdown` (0/1) declares whether the provider
-/// accepts scan pushdown (design D4). Returns NULL on success or an error
-/// string on failure.
+/// accepts scan pushdown (design D4 of add-table-provider-pushdown).
+/// `supports_insert` (0/1) declares whether the provider accepts
+/// INSERT INTO / INSERT OVERWRITE / REPLACE INTO (design D3 of
+/// add-table-provider-insert): when set, `INSERT` delivers rows to
+/// `go_table_insert`; when clear, `INSERT` fails with a "does not support
+/// INSERT" error and no FFI call is made. Returns NULL on success or an
+/// error string on failure.
 ///
 /// # Safety
 /// `session` must be a live handle returned by [`df_session_new`]. `name`
@@ -161,6 +166,7 @@ pub unsafe extern "C" fn df_session_register_table(
     name: *const c_char,
     handle: usize,
     supports_pushdown: u8,
+    supports_insert: u8,
 ) -> *mut c_char {
     if session.is_null() {
         return error_to_cstring("session handle is null");
@@ -185,7 +191,8 @@ pub unsafe extern "C" fn df_session_register_table(
 
         // try_new releases the handle itself on failure; after this point
         // the provider's Drop impl owns the release.
-        let provider = GoTableProvider::try_new(handle, supports_pushdown != 0)?;
+        let provider =
+            GoTableProvider::try_new(handle, supports_pushdown != 0, supports_insert != 0)?;
         ctx.register_table(name, Arc::new(provider))
             .map_err(|e| format!("registering table '{name}': {e}"))?;
         Ok(())

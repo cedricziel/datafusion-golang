@@ -179,10 +179,15 @@ impl SchemaProvider for GoSchemaProvider {
             // No new table-scan code path: a catalog-discovered table is
             // wrapped by the exact same GoTableProvider a
             // RegisterTable-registered table uses (design D1, D2).
-            let provider = GoTableProvider::try_new(out_table_handle, out_supports_pushdown != 0)
-                .map_err(|e| {
-                format!("constructing catalog-discovered table '{name_owned}': {e}")
-            })?;
+            // Insert support does not compose through a catalog in this
+            // change (add-table-provider-insert's Impact section scopes
+            // it to df_session_register_table only) — a catalog-discovered
+            // table is never insert-capable, unchanged from before.
+            let provider =
+                GoTableProvider::try_new(out_table_handle, out_supports_pushdown != 0, false)
+                    .map_err(|e| {
+                        format!("constructing catalog-discovered table '{name_owned}': {e}")
+                    })?;
             Ok(Some(provider))
         })
         .await
@@ -329,7 +334,9 @@ mod tests {
             let session = new_session();
             let table_handle = crate::ffi::tests::TABLE_OK + 4000;
             let cname = CString::new("people").unwrap();
-            assert!(df_session_register_table(session, cname.as_ptr(), table_handle, 0).is_null());
+            assert!(
+                df_session_register_table(session, cname.as_ptr(), table_handle, 0, 0).is_null()
+            );
 
             let batches = query(session, "SELECT * FROM people").unwrap();
             assert_eq!(

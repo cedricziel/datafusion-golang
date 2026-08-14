@@ -328,7 +328,8 @@ mod tests {
             use crate::ffi::tests::TABLE_OK;
             let session = new_session();
             let cname = CString::new("combo_t").unwrap();
-            let err = crate::df_session_register_table(session, cname.as_ptr(), TABLE_OK + 90, 0);
+            let err =
+                crate::df_session_register_table(session, cname.as_ptr(), TABLE_OK + 90, 0, 0);
             assert!(err.is_null());
             assert_eq!(register(session, "combofn", UDF_DOUBLE + 90), None);
 

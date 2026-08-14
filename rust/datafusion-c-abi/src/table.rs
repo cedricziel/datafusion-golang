@@ -8,14 +8,19 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{Schema, SchemaRef};
+use arrow::error::ArrowError;
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow::record_batch::RecordBatchReader;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{exec_err, internal_err, DataFusionError, Result};
+use datafusion::common::{
+    exec_err, internal_err, not_impl_err, DataFusionError, Result, SchemaExt,
+};
+use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -23,9 +28,11 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
+use futures::StreamExt;
 
 use crate::ffi::{
-    go_table_release, go_table_scan, go_table_schema, spawn_go_blocking, take_go_error,
+    go_table_insert, go_table_release, go_table_scan, go_table_schema, spawn_go_blocking,
+    take_go_error,
 };
 use crate::pushdown;
 
@@ -37,13 +44,18 @@ pub(crate) struct GoTableProvider {
     handle: usize,
     schema: SchemaRef,
     supports_pushdown: bool,
+    supports_insert: bool,
 }
 
 impl GoTableProvider {
     /// Takes ownership of `handle`. On error the handle is released via
     /// `go_table_release` before returning, so the caller never needs to
     /// clean up.
-    pub(crate) fn try_new(handle: usize, supports_pushdown: bool) -> Result<Self, String> {
+    pub(crate) fn try_new(
+        handle: usize,
+        supports_pushdown: bool,
+        supports_insert: bool,
+    ) -> Result<Self, String> {
         // Registration runs on the Go caller's own thread (a direct FFI
         // call, not a tokio worker), so calling back into Go inline here
         // cannot starve the shared runtime.
@@ -59,6 +71,7 @@ impl GoTableProvider {
                 handle,
                 schema: Arc::new(schema),
                 supports_pushdown,
+                supports_insert,
             }),
             Err(e) => {
                 unsafe { go_table_release(handle) };
@@ -135,6 +148,151 @@ impl TableProvider for GoTableProvider {
             projection.cloned(),
             pushdown,
         )))
+    }
+
+    async fn insert_into(
+        &self,
+        _state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if !self.supports_insert {
+            return not_impl_err!("table does not support INSERT");
+        }
+        // The SQL planner already projects/casts the input to the
+        // registered schema (design Context); this is defense-in-depth,
+        // the same check MemTable's own insert_into makes.
+        self.schema
+            .logically_equivalent_names_and_types(&input.schema())?;
+
+        Ok(Arc::new(DataSinkExec::new(
+            input,
+            Arc::new(GoDataSink {
+                handle: self.handle,
+                schema: Arc::clone(&self.schema),
+                insert_op,
+            }),
+            None,
+        )))
+    }
+}
+
+/// Number of in-flight record batches the write_all bridge (design D4)
+/// buffers between the async pump task and the synchronous Go-facing
+/// reader. Small and fixed: this bounds memory, not throughput — Go pulls
+/// as fast as it commits.
+const INSERT_CHANNEL_CAPACITY: usize = 8;
+
+fn insert_op_to_i32(op: InsertOp) -> i32 {
+    match op {
+        InsertOp::Append => 0,
+        InsertOp::Overwrite => 1,
+        InsertOp::Replace => 2,
+    }
+}
+
+/// `DataSink` that delivers an INSERT statement's input rows to Go via
+/// `go_table_insert`, bridging the async input stream to Go's synchronous
+/// pull through a bounded channel (design D4).
+#[derive(Debug)]
+struct GoDataSink {
+    handle: usize,
+    schema: SchemaRef,
+    insert_op: InsertOp,
+}
+
+impl DisplayAs for GoDataSink {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "GoDataSink")
+    }
+}
+
+/// Synchronous `RecordBatchReader` over the receiving end of the bridge
+/// channel. `blocking_recv` is only valid off the async runtime's worker
+/// threads; every use of this type runs inside `spawn_go_blocking`
+/// (design D4), i.e. on the blocking pool, never a worker thread.
+struct ChannelReader {
+    schema: SchemaRef,
+    rx: tokio::sync::mpsc::Receiver<Result<RecordBatch>>,
+}
+
+impl Iterator for ChannelReader {
+    type Item = std::result::Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.rx
+            .blocking_recv()
+            .map(|r| r.map_err(|e| ArrowError::ExternalError(Box::new(e))))
+    }
+}
+
+impl RecordBatchReader for ChannelReader {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
+#[async_trait]
+impl DataSink for GoDataSink {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    async fn write_all(
+        &self,
+        mut data: SendableRecordBatchStream,
+        _context: &Arc<TaskContext>,
+    ) -> Result<u64> {
+        let (tx, rx) = tokio::sync::mpsc::channel(INSERT_CHANNEL_CAPACITY);
+
+        // Pulls the input plan and forwards each batch (or its error) into
+        // the bridge channel. Must be joined before this function returns
+        // on every path — success, Go-side error, or early Go return — so
+        // an in-flight pull (e.g. a scan of another Go table sourcing an
+        // `INSERT ... SELECT`) never outlives the statement (design D6).
+        let pump = crate::runtime().spawn(async move {
+            while let Some(item) = data.next().await {
+                if tx.send(item).await.is_err() {
+                    // Receiver dropped: the Go call returned (successfully
+                    // or not) without draining further. Stop pulling.
+                    break;
+                }
+            }
+        });
+
+        let handle = self.handle;
+        let schema = Arc::clone(&self.schema);
+        let insert_op = insert_op_to_i32(self.insert_op);
+        let result = spawn_go_blocking(move || {
+            let reader = ChannelReader { schema, rx };
+            let mut ffi_stream = FFI_ArrowArrayStream::new(Box::new(reader));
+            let mut rows: u64 = 0;
+            let mut err: *mut std::ffi::c_char = ptr::null_mut();
+            unsafe {
+                go_table_insert(handle, &mut ffi_stream, insert_op, &mut rows, &mut err);
+            }
+            if let Some(msg) = unsafe { take_go_error(err) } {
+                return Err(msg);
+            }
+            Ok(rows)
+        })
+        .await;
+
+        // Always await the pump, on every path (design D6) — a detached
+        // pull from the input plan must not survive this function. A
+        // panic in the pump (as opposed to a normal Err polled from the
+        // input stream, already forwarded through the channel above)
+        // drops `tx` the same way a clean finish does, so Go would
+        // otherwise see an ordinary end-of-stream and could report a
+        // truncated insert as a success; surface it as a failure instead,
+        // even when the Go call itself reported success.
+        match (result, pump.await) {
+            (Ok(rows), Ok(())) => Ok(rows),
+            (Ok(_), Err(join_err)) => Err(DataFusionError::Execution(format!(
+                "insert input pump failed: {join_err}"
+            ))),
+            (Err(msg), _) => Err(DataFusionError::Execution(msg)),
+        }
     }
 }
 
@@ -393,7 +551,8 @@ impl ExecutionPlan for GoTableExec {
 mod tests {
     use super::*;
     use crate::ffi::tests::{
-        released_tables, scan_records_for, TABLE_OK, TABLE_PUSHDOWN_OK,
+        insert_records_for, released_tables, scan_records_for, INSERT_APPEND_ONLY,
+        INSERT_ERR_IMMEDIATE, INSERT_ERR_MIDSTREAM, INSERT_OK, TABLE_OK, TABLE_PUSHDOWN_OK,
         TABLE_PUSHDOWN_WRONG_SCHEMA, TABLE_SCAN_MIDSTREAM_ERR, TABLE_SCAN_OPEN_ERR,
         TABLE_SCHEMA_ERR,
     };
@@ -432,7 +591,25 @@ mod tests {
     ) -> Option<String> {
         let cname = CString::new(name).unwrap();
         let err =
-            df_session_register_table(session, cname.as_ptr(), handle, supports_pushdown as u8);
+            df_session_register_table(session, cname.as_ptr(), handle, supports_pushdown as u8, 0);
+        if err.is_null() {
+            None
+        } else {
+            let msg = CStr::from_ptr(err).to_string_lossy().into_owned();
+            crate::df_string_free(err);
+            Some(msg)
+        }
+    }
+
+    unsafe fn register_with_insert(
+        session: *mut std::ffi::c_void,
+        name: &str,
+        handle: usize,
+        supports_insert: bool,
+    ) -> Option<String> {
+        let cname = CString::new(name).unwrap();
+        let err =
+            df_session_register_table(session, cname.as_ptr(), handle, 0, supports_insert as u8);
         if err.is_null() {
             None
         } else {
@@ -765,5 +942,199 @@ mod tests {
         let records = scan_records_for(handle);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].projection, None, "None projection crosses as -1");
+    }
+
+    fn total_rows(batches: &[RecordBatch]) -> i64 {
+        batches.iter().map(|b| b.num_rows() as i64).sum()
+    }
+
+    fn count_column(batches: &[RecordBatch]) -> u64 {
+        assert_eq!(batches.len(), 1, "DML result is a single row");
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .expect("count column must be UInt64");
+        assert_eq!(col.len(), 1);
+        col.value(0)
+    }
+
+    #[test]
+    fn insert_reaches_go_table_insert_with_append_and_full_schema() {
+        unsafe {
+            let session = new_session();
+            let handle = INSERT_OK + 200;
+            assert_eq!(register_with_insert(session, "t", handle, true), None);
+
+            let (schema, batches) =
+                query(session, "INSERT INTO t VALUES (1, 'alice'), (2, 'bob')").unwrap();
+            assert_eq!(schema.field(0).name(), "count");
+            assert_eq!(count_column(&batches), 2);
+
+            let records = insert_records_for(handle);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].insert_op, 0, "INSERT INTO must deliver Append");
+            assert_eq!(total_rows(&records[0].rows), 2);
+            assert_eq!(records[0].rows[0].schema().fields().len(), 2);
+
+            df_session_free(session);
+        }
+    }
+
+    #[test]
+    fn insert_against_non_writable_provider_fails_without_invoking_it() {
+        unsafe {
+            let session = new_session();
+            let handle = TABLE_OK + 210;
+            assert_eq!(register(session, "ro", handle), None);
+
+            let err = query(session, "INSERT INTO ro VALUES (1, 'alice')").unwrap_err();
+            assert!(
+                err.contains("does not support INSERT"),
+                "unexpected message: {err}"
+            );
+            assert!(insert_records_for(handle).is_empty());
+
+            let (_, batches) = query(session, "SELECT 1 AS one").unwrap();
+            assert_eq!(batches[0].num_rows(), 1, "session remains usable");
+            df_session_free(session);
+        }
+    }
+
+    #[test]
+    fn insert_select_from_another_registered_table() {
+        unsafe {
+            let session = new_session();
+            let src = TABLE_OK + 220;
+            let dst = INSERT_OK + 230;
+            assert_eq!(register(session, "src", src), None);
+            assert_eq!(register_with_insert(session, "dst", dst, true), None);
+
+            let (_, batches) = query(session, "INSERT INTO dst SELECT * FROM src").unwrap();
+            assert_eq!(
+                count_column(&batches),
+                4,
+                "stub source table produces 2 batches x 2 rows"
+            );
+
+            let records = insert_records_for(dst);
+            assert_eq!(records.len(), 1);
+            assert_eq!(total_rows(&records[0].rows), 4);
+            df_session_free(session);
+        }
+    }
+
+    #[test]
+    fn insert_midstream_input_error_surfaces_and_session_stays_usable() {
+        unsafe {
+            let session = new_session();
+            let src = TABLE_SCAN_MIDSTREAM_ERR + 240;
+            let dst = INSERT_OK + 250;
+            assert_eq!(register(session, "src2", src), None);
+            assert_eq!(register_with_insert(session, "dst2", dst, true), None);
+
+            let err = query(session, "INSERT INTO dst2 SELECT * FROM src2").unwrap_err();
+            assert!(!err.is_empty());
+
+            let (_, batches) = query(session, "SELECT 1 AS one").unwrap();
+            assert_eq!(batches[0].num_rows(), 1, "session remains usable");
+            df_session_free(session);
+        }
+    }
+
+    #[test]
+    fn insert_stub_error_immediate_surfaces_and_session_stays_usable() {
+        unsafe {
+            let session = new_session();
+            let handle = INSERT_ERR_IMMEDIATE + 260;
+            assert_eq!(register_with_insert(session, "t3", handle, true), None);
+
+            let err = query(session, "INSERT INTO t3 VALUES (1, 'alice')").unwrap_err();
+            assert!(
+                err.contains("insert failed immediately"),
+                "unexpected message: {err}"
+            );
+
+            let (_, batches) = query(session, "SELECT 1 AS one").unwrap();
+            assert_eq!(batches[0].num_rows(), 1, "session remains usable");
+            df_session_free(session);
+        }
+    }
+
+    #[test]
+    fn insert_stub_error_after_partial_consumption_surfaces_and_session_stays_usable() {
+        unsafe {
+            let session = new_session();
+            let src = TABLE_OK + 270;
+            let dst = INSERT_ERR_MIDSTREAM + 280;
+            assert_eq!(register(session, "src3", src), None);
+            assert_eq!(register_with_insert(session, "dst3", dst, true), None);
+
+            let err = query(session, "INSERT INTO dst3 SELECT * FROM src3").unwrap_err();
+            assert!(
+                err.contains("insert failed mid-stream"),
+                "unexpected message: {err}"
+            );
+
+            let (_, batches) = query(session, "SELECT 1 AS one").unwrap();
+            assert_eq!(batches[0].num_rows(), 1, "session remains usable");
+            df_session_free(session);
+        }
+    }
+
+    #[test]
+    fn insert_overwrite_delivers_overwrite_mode() {
+        unsafe {
+            let session = new_session();
+            let handle = INSERT_OK + 290;
+            assert_eq!(register_with_insert(session, "t4", handle, true), None);
+
+            let (_, batches) = query(session, "INSERT OVERWRITE t4 VALUES (1, 'alice')").unwrap();
+            assert_eq!(count_column(&batches), 1);
+
+            let records = insert_records_for(handle);
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].insert_op, 1,
+                "INSERT OVERWRITE must deliver Overwrite"
+            );
+            df_session_free(session);
+        }
+    }
+
+    #[test]
+    fn insert_provider_rejecting_non_append_fails_overwrite() {
+        unsafe {
+            let session = new_session();
+            let handle = INSERT_APPEND_ONLY + 300;
+            assert_eq!(register_with_insert(session, "t5", handle, true), None);
+
+            let err = query(session, "INSERT OVERWRITE t5 VALUES (1, 'alice')").unwrap_err();
+            assert!(
+                err.contains("only Append is supported"),
+                "unexpected message: {err}"
+            );
+
+            let (_, batches) = query(session, "SELECT 1 AS one").unwrap();
+            assert_eq!(batches[0].num_rows(), 1, "session remains usable");
+            df_session_free(session);
+        }
+    }
+
+    #[test]
+    fn replace_into_delivers_replace_mode() {
+        unsafe {
+            let session = new_session();
+            let handle = INSERT_OK + 310;
+            assert_eq!(register_with_insert(session, "t6", handle, true), None);
+
+            let (_, batches) = query(session, "REPLACE INTO t6 VALUES (1, 'alice')").unwrap();
+            assert_eq!(count_column(&batches), 1);
+
+            let records = insert_records_for(handle);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].insert_op, 2, "REPLACE INTO must deliver Replace");
+            df_session_free(session);
+        }
     }
 }
