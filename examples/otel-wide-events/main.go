@@ -5,14 +5,20 @@
 // out into flat, semantic-convention-conformant columns (the logical
 // schema) — e.g. "http.request.method", "http.response.status_code".
 //
-// AnyValue (OTel's sum-typed attribute value: string, int, double, bool,
-// ...) has no native Arrow union that plays well with Parquet, so it is
-// encoded physically as a struct-of-nullable-typed-columns — one nullable
-// field per variant, all but one NULL for any given value — nested inside
-// a list of {key, value} pairs per event. This example covers the string,
-// int, double, and bool variants; bytes/array/kvlist variants are
-// self-referential (an AnyValue can contain AnyValues) and need a
-// bounded-depth or JSON-encoded fallback beyond what this example covers.
+// AnyValue (OTel's sum-typed attribute value) has no native Arrow union
+// that plays well with Parquet, so it is encoded physically as a
+// struct-of-nullable-typed-columns — one nullable field per variant, all
+// but one NULL for any given value — nested inside a list of {key, value}
+// pairs per event. This covers all 7 AnyValue variants: string, bool,
+// int, double, bytes, array, and kvlist. array_value/kvlist_value are
+// self-referential (an AnyValue can contain AnyValues), which Arrow
+// cannot express as a true recursive type, so this example bounds nesting
+// to one level — an array_value/kvlist_value's elements may only be
+// scalar AnyValues (string/bool/int/double/bytes), never themselves
+// array_value/kvlist_value. Deeper OTel payloads (nested arrays of
+// arrays, arbitrarily nested kvlists) would need either more physical
+// nesting levels (each one a distinct, larger Arrow type, same technique
+// repeated) or a JSON/serialized-bytes fallback beyond some fixed depth.
 //
 // New events land in the physical table via INSERT INTO ... SELECT from
 // another registered provider (an in-memory "staging" table standing in
@@ -23,6 +29,12 @@
 // doesn't), but a provider-to-provider INSERT INTO ... SELECT sidesteps
 // that cast entirely — and is the more realistic ingestion shape besides,
 // since event batches arrive as Arrow data, not hand-typed SQL.
+//
+// httpEventsView's own doc comment covers a second, independent DataFusion
+// 54.1.0 limitation this example works around: MAX/FIRST_VALUE over a
+// List-typed column fails once the underlying scan spans more than one
+// batch (which two separate writes to the Parquet file — the seed data
+// and the inserted event — guarantee here).
 package main
 
 import (
@@ -41,14 +53,41 @@ import (
 	parquetprovider "github.com/cedricziel/datafusion-golang/providers/parquet"
 )
 
-// anyValueType is the physical struct-of-nullable-columns encoding for one
-// AnyValue: exactly one field is non-NULL for any given attribute value.
+// anyValueLeafType is AnyValue bounded to its 5 scalar variants — the
+// terminal case used inside array_value/kvlist_value, since this example
+// does not support nesting an array/kvlist inside another one.
+func anyValueLeafType() *arrow.StructType {
+	return arrow.StructOf(
+		arrow.Field{Name: "string_value", Type: arrow.BinaryTypes.String, Nullable: true},
+		arrow.Field{Name: "bool_value", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
+		arrow.Field{Name: "int_value", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		arrow.Field{Name: "double_value", Type: arrow.PrimitiveTypes.Float64, Nullable: true},
+		arrow.Field{Name: "bytes_value", Type: arrow.BinaryTypes.Binary, Nullable: true},
+	)
+}
+
+// kvLeafType is a {key, value} pair whose value is leaf-only — the
+// element type of kvlist_value.
+func kvLeafType() *arrow.StructType {
+	return arrow.StructOf(
+		arrow.Field{Name: "key", Type: arrow.BinaryTypes.String, Nullable: false},
+		arrow.Field{Name: "value", Type: anyValueLeafType(), Nullable: true},
+	)
+}
+
+// anyValueType is the physical struct-of-nullable-columns encoding for a
+// full, top-level AnyValue: all 7 variants, exactly one non-NULL. Its
+// first 5 fields mirror anyValueLeafType's so appendScalar can fill
+// either; array_value/kvlist_value are the two variants leaf values omit.
 func anyValueType() *arrow.StructType {
 	return arrow.StructOf(
 		arrow.Field{Name: "string_value", Type: arrow.BinaryTypes.String, Nullable: true},
+		arrow.Field{Name: "bool_value", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
 		arrow.Field{Name: "int_value", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
 		arrow.Field{Name: "double_value", Type: arrow.PrimitiveTypes.Float64, Nullable: true},
-		arrow.Field{Name: "bool_value", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
+		arrow.Field{Name: "bytes_value", Type: arrow.BinaryTypes.Binary, Nullable: true},
+		arrow.Field{Name: "array_value", Type: arrow.ListOf(anyValueLeafType()), Nullable: true},
+		arrow.Field{Name: "kvlist_value", Type: arrow.ListOf(kvLeafType()), Nullable: true},
 	)
 }
 
@@ -68,20 +107,129 @@ func wideEventsSchema() *arrow.Schema {
 	}, nil)
 }
 
-// attr is one key-value pair to attach to an event; exactly one of the
-// value fields is set. Build one with strAttr/intAttr/dblAttr/boolAttr.
-type attr struct {
-	key string
-	s   *string
-	i   *int64
-	d   *float64
-	b   *bool
+// anyValue is a Go-side AnyValue for building example data; exactly one
+// field is set. array/kvlist elements are themselves anyValue but must be
+// leaf-only (see appendLeafValue) — construct them with the scalar
+// constructors (strVal, intVal, ...), never arrayVal/kvlistVal.
+type anyValue struct {
+	str     *string
+	boolean *bool
+	i       *int64
+	d       *float64
+	bytes   []byte
+	array   []anyValue
+	kvlist  []kv
 }
 
-func strAttr(key, v string) attr         { return attr{key: key, s: &v} }
-func intAttr(key string, v int64) attr   { return attr{key: key, i: &v} }
-func dblAttr(key string, v float64) attr { return attr{key: key, d: &v} }
-func boolAttr(key string, v bool) attr   { return attr{key: key, b: &v} }
+// kv is one entry of a kvlist_value: a key paired with a leaf AnyValue.
+type kv struct {
+	key   string
+	value anyValue
+}
+
+func strVal(v string) anyValue         { return anyValue{str: &v} }
+func boolVal(v bool) anyValue          { return anyValue{boolean: &v} }
+func intVal(v int64) anyValue          { return anyValue{i: &v} }
+func dblVal(v float64) anyValue        { return anyValue{d: &v} }
+func bytesVal(v []byte) anyValue       { return anyValue{bytes: v} }
+func arrayVal(vs ...anyValue) anyValue { return anyValue{array: vs} }
+func kvlistVal(kvs ...kv) anyValue     { return anyValue{kvlist: kvs} }
+func kvPair(key string, v anyValue) kv { return kv{key: key, value: v} }
+
+// attr is one attribute (key + AnyValue) to attach to an event.
+type attr struct {
+	key   string
+	value anyValue
+}
+
+func strAttr(key, v string) attr                { return attr{key: key, value: strVal(v)} }
+func boolAttr(key string, v bool) attr          { return attr{key: key, value: boolVal(v)} }
+func intAttr(key string, v int64) attr          { return attr{key: key, value: intVal(v)} }
+func dblAttr(key string, v float64) attr        { return attr{key: key, value: dblVal(v)} }
+func bytesAttr(key string, v []byte) attr       { return attr{key: key, value: bytesVal(v)} }
+func arrayAttr(key string, vs ...anyValue) attr { return attr{key: key, value: arrayVal(vs...)} }
+func kvlistAttr(key string, kvs ...kv) attr     { return attr{key: key, value: kvlistVal(kvs...)} }
+
+// appendScalar fills the 5 scalar-variant fields (indices 0-4, the layout
+// shared by anyValueType and anyValueLeafType) from v, leaving exactly
+// the set field non-NULL.
+func appendScalar(valB *array.StructBuilder, v anyValue) {
+	sB := valB.FieldBuilder(0).(*array.StringBuilder)
+	boB := valB.FieldBuilder(1).(*array.BooleanBuilder)
+	iB := valB.FieldBuilder(2).(*array.Int64Builder)
+	dB := valB.FieldBuilder(3).(*array.Float64Builder)
+	byB := valB.FieldBuilder(4).(*array.BinaryBuilder)
+
+	if v.str != nil {
+		sB.Append(*v.str)
+	} else {
+		sB.AppendNull()
+	}
+	if v.boolean != nil {
+		boB.Append(*v.boolean)
+	} else {
+		boB.AppendNull()
+	}
+	if v.i != nil {
+		iB.Append(*v.i)
+	} else {
+		iB.AppendNull()
+	}
+	if v.d != nil {
+		dB.Append(*v.d)
+	} else {
+		dB.AppendNull()
+	}
+	if v.bytes != nil {
+		byB.Append(v.bytes)
+	} else {
+		byB.AppendNull()
+	}
+}
+
+// appendLeafValue writes v into valB, a leaf anyValueLeafType struct slot
+// (used inside array_value/kvlist_value elements). Panics if v itself
+// tries to carry an array/kvlist: this example's physical encoding bounds
+// AnyValue nesting to one level (see the package doc comment).
+func appendLeafValue(valB *array.StructBuilder, v anyValue) {
+	if v.array != nil || v.kvlist != nil {
+		panic("otel-wide-events: array_value/kvlist_value elements must be scalar AnyValues (nesting is bounded to one level)")
+	}
+	appendScalar(valB, v)
+}
+
+// appendAnyValue writes v into valB, a top-level anyValueType struct
+// slot.
+func appendAnyValue(valB *array.StructBuilder, v anyValue) {
+	appendScalar(valB, v)
+
+	arrB := valB.FieldBuilder(5).(*array.ListBuilder)
+	if v.array != nil {
+		leafB := arrB.ValueBuilder().(*array.StructBuilder)
+		arrB.Append(true)
+		for _, elem := range v.array {
+			leafB.Append(true)
+			appendLeafValue(leafB, elem)
+		}
+	} else {
+		arrB.AppendNull()
+	}
+
+	kvlistB := valB.FieldBuilder(6).(*array.ListBuilder)
+	if v.kvlist != nil {
+		kvLeafB := kvlistB.ValueBuilder().(*array.StructBuilder)
+		kvlistB.Append(true)
+		for _, pair := range v.kvlist {
+			kvLeafB.Append(true)
+			kvLeafB.FieldBuilder(0).(*array.StringBuilder).Append(pair.key)
+			leafValB := kvLeafB.FieldBuilder(1).(*array.StructBuilder)
+			leafValB.Append(true)
+			appendLeafValue(leafValB, pair.value)
+		}
+	} else {
+		kvlistB.AppendNull()
+	}
+}
 
 // appendEvent appends one event row, with its attributes list, to b.
 func appendEvent(b *array.RecordBuilder, id int64, traceID, name string, attrs []attr) {
@@ -95,44 +243,31 @@ func appendEvent(b *array.RecordBuilder, id int64, traceID, name string, attrs [
 	for _, a := range attrs {
 		kvB.Append(true)
 		kvB.FieldBuilder(0).(*array.StringBuilder).Append(a.key)
-
 		valB := kvB.FieldBuilder(1).(*array.StructBuilder)
 		valB.Append(true)
-		sB := valB.FieldBuilder(0).(*array.StringBuilder)
-		iB := valB.FieldBuilder(1).(*array.Int64Builder)
-		dB := valB.FieldBuilder(2).(*array.Float64Builder)
-		bB := valB.FieldBuilder(3).(*array.BooleanBuilder)
-		switch {
-		case a.s != nil:
-			sB.Append(*a.s)
-			iB.AppendNull()
-			dB.AppendNull()
-			bB.AppendNull()
-		case a.i != nil:
-			sB.AppendNull()
-			iB.Append(*a.i)
-			dB.AppendNull()
-			bB.AppendNull()
-		case a.d != nil:
-			sB.AppendNull()
-			iB.AppendNull()
-			dB.Append(*a.d)
-			bB.AppendNull()
-		case a.b != nil:
-			sB.AppendNull()
-			iB.AppendNull()
-			dB.AppendNull()
-			bB.Append(*a.b)
-		}
+		appendAnyValue(valB, a.value)
 	}
 }
 
 // httpEventsView is the logical schema: a SQL view over wide_events that
 // unnests attributes and pivots specific keys out into flat,
 // semantic-convention-conformant columns (quoted, dotted names — exactly
-// how OTel semconv names its attributes). MAX(CASE WHEN ...) per attribute
-// is the standard unnest-then-pivot idiom; GROUP BY event_id collapses
-// each event's attribute rows back into one output row per event.
+// how OTel semconv names its attributes). MAX(CASE WHEN ...) is the
+// standard unnest-then-pivot idiom and is used for the 6 scalar variants
+// (each event has at most one row per attribute key, so MAX just selects
+// the single non-NULL value). It cannot be used for array_value/
+// kvlist_value, though: DataFusion 54.1.0's MAX (and FIRST_VALUE)
+// accumulator for List-typed columns fails with "not possible to
+// concatenate arrays of different data types" once the underlying scan
+// spans more than one batch — reproducible independent of this example
+// (a plain multi-row-group Parquet scan is enough), so a real upstream
+// limitation, not something wrong with the physical encoding. ARRAY_AGG's
+// accumulator does not have this problem; wrapping it with a FILTER (at
+// most one match per group, same as the CASE WHEN branches) and unwrapping
+// the resulting one-element outer list with array_element(..., 1) gets
+// back to the same shape MAX would have produced. GROUP BY event_id
+// collapses each event's attribute rows back into one output row per
+// event.
 const httpEventsView = `CREATE VIEW http_events AS
 SELECT
     event_id,
@@ -143,7 +278,10 @@ SELECT
     MAX(CASE WHEN u.key = 'client.address' THEN u.value.string_value END) AS "client.address",
     MAX(CASE WHEN u.key = 'http.response.status_code' THEN u.value.int_value END) AS "http.response.status_code",
     MAX(CASE WHEN u.key = 'http.server.request.duration' THEN u.value.double_value END) AS "http.server.request.duration",
-    MAX(CASE WHEN u.key = 'error' THEN u.value.bool_value END) AS "error"
+    MAX(CASE WHEN u.key = 'error' THEN u.value.bool_value END) AS "error",
+    MAX(CASE WHEN u.key = 'debug.payload_prefix' THEN u.value.bytes_value END) AS "debug.payload_prefix",
+    array_element(ARRAY_AGG(u.value.array_value) FILTER (WHERE u.key = 'http.request.header.accept'), 1) AS "http.request.header.accept",
+    array_element(ARRAY_AGG(u.value.kvlist_value) FILTER (WHERE u.key = 'debug.context'), 1) AS "debug.context"
 FROM (SELECT event_id, trace_id, event_name, UNNEST(attributes) AS u FROM wide_events)
 GROUP BY event_id, trace_id, event_name`
 
@@ -181,7 +319,8 @@ func main() {
 	// New events arrive as an Arrow batch — modeled here by a small
 	// in-memory staging provider — and land in the physical table via
 	// INSERT INTO ... SELECT (see the package doc comment for why not
-	// SQL VALUES literals).
+	// SQL VALUES literals). This event also exercises the 3 variants the
+	// seed data doesn't: bytes_value, array_value, and kvlist_value.
 	staging := array.NewRecordBuilder(memory.DefaultAllocator, schema)
 	appendEvent(staging, 3, "trace-003", "http.request", []attr{
 		strAttr("http.request.method", "POST"),
@@ -190,6 +329,9 @@ func main() {
 		intAttr("http.response.status_code", 404),
 		dblAttr("http.server.request.duration", 0.031),
 		boolAttr("error", true),
+		bytesAttr("debug.payload_prefix", []byte{0xDE, 0xAD, 0xBE, 0xEF}),
+		arrayAttr("http.request.header.accept", strVal("text/html"), strVal("application/json")),
+		kvlistAttr("debug.context", kvPair("region", strVal("us-west")), kvPair("retry_count", intVal(2))),
 	})
 	stagingRec := staging.NewRecordBatch()
 	staging.Release()
@@ -211,7 +353,8 @@ func main() {
 func printHTTPEvents(sess *datafusion.SessionContext) {
 	reader, err := sess.SQL(`
 		SELECT event_id, "http.request.method", "url.path", "client.address",
-		       "http.response.status_code", "http.server.request.duration", "error"
+		       "http.response.status_code", "http.server.request.duration", "error",
+		       "debug.payload_prefix", "http.request.header.accept", "debug.context"
 		FROM http_events ORDER BY event_id`)
 	if err != nil {
 		log.Fatalf("SQL: %v", err)
