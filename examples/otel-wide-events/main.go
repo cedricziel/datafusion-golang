@@ -8,33 +8,41 @@
 // AnyValue (OTel's sum-typed attribute value) has no native Arrow union
 // that plays well with Parquet, so it is encoded physically as a
 // struct-of-nullable-typed-columns — one nullable field per variant, all
-// but one NULL for any given value — nested inside a list of {key, value}
-// pairs per event. This covers all 7 AnyValue variants: string, bool,
-// int, double, bytes, array, and kvlist. array_value/kvlist_value are
-// self-referential (an AnyValue can contain AnyValues), which Arrow
-// cannot express as a true recursive type, so this example bounds nesting
-// to one level — an array_value/kvlist_value's elements may only be
-// scalar AnyValues (string/bool/int/double/bytes), never themselves
-// array_value/kvlist_value. Deeper OTel payloads (nested arrays of
-// arrays, arbitrarily nested kvlists) would need either more physical
-// nesting levels (each one a distinct, larger Arrow type, same technique
-// repeated) or a JSON/serialized-bytes fallback beyond some fixed depth.
+// but one NULL for any given value. This covers all 7 AnyValue variants:
+// string, bool, int, double, bytes, array, and kvlist. array_value/
+// kvlist_value are self-referential (an AnyValue can contain AnyValues),
+// which Arrow cannot express as a true recursive type, so this example
+// bounds nesting to one level — an array_value/kvlist_value's elements
+// may only be scalar AnyValues (string/bool/int/double/bytes), never
+// themselves array_value/kvlist_value. Deeper OTel payloads (nested
+// arrays of arrays, arbitrarily nested kvlists) would need either more
+// physical nesting levels (each one a distinct, larger Arrow type, same
+// technique repeated) or a JSON/serialized-bytes fallback beyond some
+// fixed depth.
+//
+// Each event's attributes are a Map<Utf8, AnyValue> — OTel's actual
+// repeated-KeyValue shape, but keyed for direct lookup rather than stored
+// as a List<Struct<key,value>>. An earlier version of this example used
+// the list encoding with a CREATE VIEW that UNNEST-ed it and pivoted
+// specific keys out with MAX(CASE WHEN ...) per attribute — it worked,
+// but doesn't scale past a handful of keys, and it was the reason this
+// example hit a real DataFusion 54.1.0 bug: MAX/FIRST_VALUE's accumulator
+// for List-typed columns (array_value/kvlist_value) fails once the scan
+// spans more than one batch. The Map encoding sidesteps both problems:
+// each event has exactly one entry per attribute key already, so a direct
+// subscript (httpEventsView's `attributes['key']`) replaces UNNEST, GROUP
+// BY, and the aggregate entirely — there is no List-typed aggregation
+// left to trip the bug.
 //
 // New events land in the physical table via INSERT INTO ... SELECT from
 // another registered provider (an in-memory "staging" table standing in
 // for a real event source) rather than SQL VALUES literals: DataFusion
-// 54.1.0 cannot CAST a VALUES-literal's inferred List<Struct<...>> type to
+// 54.1.0 cannot CAST a VALUES-literal's inferred nested-type schema to
 // the registered table's exact physical type (which carries Parquet field
-// IDs and internal element-field naming the literal's inferred type
-// doesn't), but a provider-to-provider INSERT INTO ... SELECT sidesteps
-// that cast entirely — and is the more realistic ingestion shape besides,
-// since event batches arrive as Arrow data, not hand-typed SQL.
-//
-// httpEventsView's own doc comment covers a second, independent DataFusion
-// 54.1.0 limitation this example works around: MAX/FIRST_VALUE over a
-// List-typed column fails once the underlying scan spans more than one
-// batch (which two separate writes to the Parquet file — the seed data
-// and the inserted event — guarantee here).
+// IDs the literal's inferred type doesn't), but a provider-to-provider
+// INSERT INTO ... SELECT sidesteps that cast entirely — and is the more
+// realistic ingestion shape besides, since event batches arrive as Arrow
+// data, not hand-typed SQL.
 package main
 
 import (
@@ -92,18 +100,15 @@ func anyValueType() *arrow.StructType {
 }
 
 // wideEventsSchema is the physical schema: one row per event, attributes
-// as a list of {key, value AnyValue} pairs — OTel's actual repeated-KeyValue
-// shape, physically encoded in Arrow/Parquet.
+// as a Map<Utf8, AnyValue> — OTel's repeated-KeyValue shape, keyed for
+// direct lookup (see the package doc comment for why Map rather than
+// List<Struct<key,value>>).
 func wideEventsSchema() *arrow.Schema {
-	kv := arrow.StructOf(
-		arrow.Field{Name: "key", Type: arrow.BinaryTypes.String, Nullable: false},
-		arrow.Field{Name: "value", Type: anyValueType(), Nullable: true},
-	)
 	return arrow.NewSchema([]arrow.Field{
 		{Name: "event_id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
 		{Name: "trace_id", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "event_name", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "attributes", Type: arrow.ListOf(kv), Nullable: true},
+		{Name: "attributes", Type: arrow.MapOf(arrow.BinaryTypes.String, anyValueType()), Nullable: true},
 	}, nil)
 }
 
@@ -231,59 +236,66 @@ func appendAnyValue(valB *array.StructBuilder, v anyValue) {
 	}
 }
 
-// appendEvent appends one event row, with its attributes list, to b.
+// appendEvent appends one event row, with its attributes map, to b.
 func appendEvent(b *array.RecordBuilder, id int64, traceID, name string, attrs []attr) {
 	b.Field(0).(*array.Int64Builder).Append(id)
 	b.Field(1).(*array.StringBuilder).Append(traceID)
 	b.Field(2).(*array.StringBuilder).Append(name)
 
-	listB := b.Field(3).(*array.ListBuilder)
-	kvB := listB.ValueBuilder().(*array.StructBuilder)
-	listB.Append(true)
+	mapB := b.Field(3).(*array.MapBuilder)
+	keyB := mapB.KeyBuilder().(*array.StringBuilder)
+	valB := mapB.ItemBuilder().(*array.StructBuilder)
+	mapB.Append(true)
 	for _, a := range attrs {
-		kvB.Append(true)
-		kvB.FieldBuilder(0).(*array.StringBuilder).Append(a.key)
-		valB := kvB.FieldBuilder(1).(*array.StructBuilder)
+		keyB.Append(a.key)
 		valB.Append(true)
 		appendAnyValue(valB, a.value)
 	}
 }
 
 // httpEventsView is the logical schema: a SQL view over wide_events that
-// unnests attributes and pivots specific keys out into flat,
+// looks up specific attribute keys and projects them out into flat,
 // semantic-convention-conformant columns (quoted, dotted names — exactly
-// how OTel semconv names its attributes). MAX(CASE WHEN ...) is the
-// standard unnest-then-pivot idiom and is used for the 6 scalar variants
-// (each event has at most one row per attribute key, so MAX just selects
-// the single non-NULL value). It cannot be used for array_value/
-// kvlist_value, though: DataFusion 54.1.0's MAX (and FIRST_VALUE)
-// accumulator for List-typed columns fails with "not possible to
-// concatenate arrays of different data types" once the underlying scan
-// spans more than one batch — reproducible independent of this example
-// (a plain multi-row-group Parquet scan is enough), so a real upstream
-// limitation, not something wrong with the physical encoding. ARRAY_AGG's
-// accumulator does not have this problem; wrapping it with a FILTER (at
-// most one match per group, same as the CASE WHEN branches) and unwrapping
-// the resulting one-element outer list with array_element(..., 1) gets
-// back to the same shape MAX would have produced. GROUP BY event_id
-// collapses each event's attribute rows back into one output row per
-// event.
+// how OTel semconv names its attributes).
+//
+// Each subscript (attributes['key']) has to be aliased in the inner
+// subquery before its fields can be dot-accessed in the outer SELECT —
+// DataFusion 54.1.0's parser rejects chaining .field directly onto a
+// subscript expression ("Dot access not supported for non-string expr"),
+// the same limitation UNNEST(...).field hit in this example's first
+// version. Aliasing first and dot-accessing the alias works cleanly, is
+// resolved once per row (not once per key against every row, the way
+// UNNEST+GROUP BY was), and — because there is no aggregation here at
+// all — never touches the MAX-over-List bug that motivated moving off
+// the List<Struct> encoding in the first place.
 const httpEventsView = `CREATE VIEW http_events AS
 SELECT
     event_id,
     trace_id,
     event_name,
-    MAX(CASE WHEN u.key = 'http.request.method' THEN u.value.string_value END) AS "http.request.method",
-    MAX(CASE WHEN u.key = 'url.path' THEN u.value.string_value END) AS "url.path",
-    MAX(CASE WHEN u.key = 'client.address' THEN u.value.string_value END) AS "client.address",
-    MAX(CASE WHEN u.key = 'http.response.status_code' THEN u.value.int_value END) AS "http.response.status_code",
-    MAX(CASE WHEN u.key = 'http.server.request.duration' THEN u.value.double_value END) AS "http.server.request.duration",
-    MAX(CASE WHEN u.key = 'error' THEN u.value.bool_value END) AS "error",
-    MAX(CASE WHEN u.key = 'debug.payload_prefix' THEN u.value.bytes_value END) AS "debug.payload_prefix",
-    array_element(ARRAY_AGG(u.value.array_value) FILTER (WHERE u.key = 'http.request.header.accept'), 1) AS "http.request.header.accept",
-    array_element(ARRAY_AGG(u.value.kvlist_value) FILTER (WHERE u.key = 'debug.context'), 1) AS "debug.context"
-FROM (SELECT event_id, trace_id, event_name, UNNEST(attributes) AS u FROM wide_events)
-GROUP BY event_id, trace_id, event_name`
+    m_method.string_value AS "http.request.method",
+    m_path.string_value AS "url.path",
+    m_addr.string_value AS "client.address",
+    m_status.int_value AS "http.response.status_code",
+    m_dur.double_value AS "http.server.request.duration",
+    m_err.bool_value AS "error",
+    m_payload.bytes_value AS "debug.payload_prefix",
+    m_accept.array_value AS "http.request.header.accept",
+    m_ctx.kvlist_value AS "debug.context"
+FROM (
+    SELECT
+        event_id, trace_id, event_name,
+        attributes['http.request.method'] AS m_method,
+        attributes['url.path'] AS m_path,
+        attributes['client.address'] AS m_addr,
+        attributes['http.response.status_code'] AS m_status,
+        attributes['http.server.request.duration'] AS m_dur,
+        attributes['error'] AS m_err,
+        attributes['debug.payload_prefix'] AS m_payload,
+        attributes['http.request.header.accept'] AS m_accept,
+        attributes['debug.context'] AS m_ctx
+    FROM wide_events
+)`
 
 func main() {
 	dir, err := os.MkdirTemp("", "otel-wide-events-example")
