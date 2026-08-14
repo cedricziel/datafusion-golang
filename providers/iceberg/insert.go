@@ -78,18 +78,42 @@ func (t *writableTableProvider) InsertInto(ctx context.Context, op datafusion.In
 		return 0, fmt.Errorf("iceberg: loading %s for insert: %w", t.describe(), err)
 	}
 
-	switch op {
-	case datafusion.InsertAppend:
-		if _, err := tbl.Append(ctx, wrapped, nil); err != nil {
-			return 0, fmt.Errorf("iceberg: append to %s: %w", t.describe(), err)
+	if err := commitOffCgoCallbackThread(func() error {
+		var err error
+		switch op {
+		case datafusion.InsertAppend:
+			_, err = tbl.Append(ctx, wrapped, nil)
+		case datafusion.InsertOverwrite:
+			_, err = tbl.Overwrite(ctx, wrapped, nil)
 		}
-	case datafusion.InsertOverwrite:
-		if _, err := tbl.Overwrite(ctx, wrapped, nil); err != nil {
-			return 0, fmt.Errorf("iceberg: overwrite %s: %w", t.describe(), err)
-		}
+		return err
+	}); err != nil {
+		return 0, fmt.Errorf("iceberg: %s %s: %w", commitVerb(op), t.describe(), err)
 	}
 
 	return wrapped.rowsConsumed(), nil
+}
+
+// commitOffCgoCallbackThread runs commit on a freshly spawned goroutine and
+// waits for it. Table.Append/Overwrite's write path uses iter.Pull-based
+// coroutines internally (iceberg-go's rolling data writer), which require
+// the resuming goroutine's OS-thread-locking state to match its creating
+// state exactly. InsertInto is invoked from Rust through a cgo callback,
+// and the callback goroutine is pinned to the calling C thread for the
+// callback's duration — a locking state those coroutines can't tolerate,
+// causing a runtime fatal error ("coro: OS thread locking must match
+// locking at coroutine creation"). A plain goroutine has no such pinning.
+func commitOffCgoCallbackThread(commit func() error) error {
+	errCh := make(chan error, 1)
+	go func() { errCh <- commit() }()
+	return <-errCh
+}
+
+func commitVerb(op datafusion.InsertOp) string {
+	if op == datafusion.InsertOverwrite {
+		return "overwrite"
+	}
+	return "append to"
 }
 
 // fieldIDStrippingReader wraps an array.RecordReader, presenting every
