@@ -84,15 +84,55 @@ type PushdownTableProvider interface {
 	ScanWithOptions(ctx context.Context, opts *ScanOptions) (array.RecordReader, error)
 }
 
+// InsertOp identifies which SQL insert statement produced the rows passed
+// to WritableTableProvider.InsertInto.
+type InsertOp int32
+
+const (
+	InsertAppend    InsertOp = 0 // INSERT INTO
+	InsertOverwrite InsertOp = 1 // INSERT OVERWRITE
+	InsertReplace   InsertOp = 2 // REPLACE INTO
+)
+
+// WritableTableProvider is an optional extension of TableProvider. A
+// provider that implements it is registered with INSERT support enabled:
+// INSERT INTO / INSERT OVERWRITE / REPLACE INTO against the registered
+// table delivers rows to InsertInto. Providers implementing only
+// TableProvider (or PushdownTableProvider) keep today's behavior: INSERT
+// against them fails with a "does not support INSERT" query error.
+//
+// Goroutine safety extends to scan-during-insert: like Schema/Scan, an
+// implementation may be called from multiple engine-internal threads
+// concurrently, including a Scan running while an InsertInto is still in
+// progress (e.g. a self-insert, INSERT INTO t SELECT ... FROM t). Whether
+// a concurrent scan observes rows from an in-flight insert is entirely
+// this implementation's choice — the engine does not synchronize the two.
+type WritableTableProvider interface {
+	TableProvider
+	// InsertInto consumes rows — already planned, reordered, defaulted,
+	// and cast to the registered schema by the engine — and returns the
+	// number of rows written. Ownership of rows passes to the
+	// implementation, which must release it.
+	//
+	// Called at most once per INSERT statement; the engine delivers the
+	// stream exactly once and never retries, so the implementation must
+	// commit or roll back before returning — if it returns an error after
+	// consuming some rows, whether those rows remain visible is this
+	// implementation's contract to define, not the engine's. A mode this
+	// provider doesn't support should return an error for op rather than
+	// guessing.
+	InsertInto(ctx context.Context, op InsertOp, rows array.RecordReader) (uint64, error)
+}
+
 // RegisterTable registers a Go-implemented table under the given name,
 // making it queryable via SQL on this session. Registering a name that is
 // already in use returns an error and leaves the existing table
 // unchanged. The engine holds a reference to the provider until the
 // session is closed.
 //
-// If the provider also implements PushdownTableProvider, it is registered
-// with scan pushdown enabled; the capability is detected here and needs
-// no separate configuration.
+// If the provider also implements PushdownTableProvider and/or
+// WritableTableProvider, those capabilities are registered too; each is
+// detected here and needs no separate configuration.
 func (s *SessionContext) RegisterTable(name string, provider TableProvider) error {
 	if provider == nil {
 		return errors.New("datafusion: table provider is nil")
@@ -107,16 +147,19 @@ func (s *SessionContext) RegisterTable(name string, provider TableProvider) erro
 	cName := C.CString(name)
 	defer C.free(unsafe.Pointer(cName))
 
-	var supportsPushdown C.uint8_t
+	var supportsPushdown, supportsInsert C.uint8_t
 	if _, ok := provider.(PushdownTableProvider); ok {
 		supportsPushdown = 1
+	}
+	if _, ok := provider.(WritableTableProvider); ok {
+		supportsInsert = 1
 	}
 
 	// Ownership of the handle passes to the engine on entry: on success it
 	// is released when the session is freed, on failure the engine calls
 	// go_table_release before returning (see datafusion_go.h).
 	handle := cgo.NewHandle(provider)
-	cErr := C.df_session_register_table(s.handle, cName, C.uintptr_t(handle), supportsPushdown)
+	cErr := C.df_session_register_table(s.handle, cName, C.uintptr_t(handle), supportsPushdown, supportsInsert)
 	return cErrorToGo(cErr)
 }
 
@@ -278,4 +321,53 @@ func (p *projectedReader) Release() {
 //export go_table_release
 func go_table_release(handle C.uintptr_t) {
 	releaseCgoHandle(handle)
+}
+
+// insertOpFromC validates the wire value against the known InsertOp
+// constants rather than assuming it — both sides are one link unit, so an
+// unknown value would be a bug, but decode failures are surfaced loudly
+// per the project's existing convention (see decodeFilters).
+func insertOpFromC(v C.int32_t) (InsertOp, error) {
+	switch op := InsertOp(v); op {
+	case InsertAppend, InsertOverwrite, InsertReplace:
+		return op, nil
+	default:
+		return 0, fmt.Errorf("datafusion: unknown insert op %d", v)
+	}
+}
+
+//export go_table_insert
+func go_table_insert(handle C.uintptr_t, inStream *C.struct_ArrowArrayStream, insertOp C.int32_t,
+	rowsOut *C.uint64_t, errOut **C.char) {
+	defer trapCallbackPanic("WritableTableProvider.InsertInto", errOut)
+
+	provider := cgo.Handle(handle).Value().(WritableTableProvider)
+
+	op, err := insertOpFromC(insertOp)
+	if err != nil {
+		setCallbackError(errOut, err.Error())
+		return
+	}
+
+	// Ownership of the stream transfers to us on entry (the reverse of
+	// go_table_scan, where Go produces the stream); Release drops it
+	// regardless of what InsertInto does with the rows.
+	imported, err := cdata.ImportCRecordReader((*cdata.CArrowArrayStream)(unsafe.Pointer(inStream)), nil)
+	if err != nil {
+		setCallbackError(errOut, fmt.Sprintf("importing insert stream: %v", err))
+		return
+	}
+	rows, ok := imported.(array.RecordReader)
+	if !ok {
+		setCallbackError(errOut, "imported insert stream does not implement array.RecordReader")
+		return
+	}
+	defer rows.Release()
+
+	written, err := provider.InsertInto(context.Background(), op, rows)
+	if err != nil {
+		setCallbackError(errOut, err.Error())
+		return
+	}
+	*rowsOut = C.uint64_t(written)
 }
