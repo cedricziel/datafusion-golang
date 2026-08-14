@@ -43,6 +43,14 @@
 // INSERT INTO ... SELECT sidesteps that cast entirely — and is the more
 // realistic ingestion shape besides, since event batches arrive as Arrow
 // data, not hand-typed SQL.
+//
+// attr_udf.go demonstrates a second way to read attributes: Go ScalarUDFs
+// (otel_attr_string/bool/int/double/bytes) that extract one named
+// attribute's value directly, callable from SQL with no view or subscript
+// access at all. This needs no engine changes — scalar UDF registration
+// already exists — and works purely by walking the attributes column's
+// Arrow value in Go, so it is agnostic to the SQL-level access pattern
+// httpEventsView uses.
 package main
 
 import (
