@@ -324,6 +324,9 @@ func main() {
 	if _, err := sess.SQL(httpEventsView); err != nil {
 		log.Fatalf("CREATE VIEW http_events: %v", err)
 	}
+	if err := registerAttrUDFs(sess, events.Schema().Field(3).Type); err != nil {
+		log.Fatalf("registerAttrUDFs: %v", err)
+	}
 
 	fmt.Println("--- http_events, before insert ---")
 	printHTTPEvents(sess)
@@ -360,6 +363,29 @@ func main() {
 
 	fmt.Println("--- http_events, after insert ---")
 	printHTTPEvents(sess)
+
+	// Same physical attributes column, read a second way: a Go ScalarUDF
+	// per scalar variant, called directly against wide_events with no
+	// view or subscript access involved (see attr_udf.go).
+	fmt.Println("--- direct attribute extraction via otel_attr_* UDFs ---")
+	udfReader, err := sess.SQL(`
+		SELECT event_id,
+		       otel_attr_string(attributes, 'http.request.method') AS method,
+		       otel_attr_int(attributes, 'http.response.status_code') AS status_code,
+		       otel_attr_double(attributes, 'http.server.request.duration') AS duration,
+		       otel_attr_bool(attributes, 'error') AS is_error,
+		       otel_attr_bytes(attributes, 'debug.payload_prefix') AS payload_prefix
+		FROM wide_events ORDER BY event_id`)
+	if err != nil {
+		log.Fatalf("SQL (otel_attr_*): %v", err)
+	}
+	defer udfReader.Release()
+	for udfReader.Next() {
+		fmt.Println(udfReader.RecordBatch())
+	}
+	if err := udfReader.Err(); err != nil {
+		log.Fatalf("reading result: %v", err)
+	}
 }
 
 func printHTTPEvents(sess *datafusion.SessionContext) {
