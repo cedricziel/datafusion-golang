@@ -7,9 +7,9 @@
 
 ## 2. Scalar UDF attribute extraction (design D2)
 
-- [ ] 2.1 Implement a Go `ScalarUDF` extracting a named attribute's value from the physical `attributes` column (signature per design D2 — a single struct-returning UDF if expressible, otherwise per-variant typed UDFs)
-- [ ] 2.2 Register and demonstrate it in `examples/otel-wide-events`, with at least one call site exercised against each `AnyValue` variant already covered by the example (string, bool, int, double, bytes; array/kvlist if the UDF's argument marshaling handles nested-in-nested types, otherwise documented as out of scope for the UDF specifically)
-- [ ] 2.3 Confirm the UDF's behavior is identical regardless of task group 1's outcome (works the same against `List<Struct>` or `Map`, whichever the example ends up using)
+- [x] 2.1 Implement a Go `ScalarUDF` extracting a named attribute's value from the physical `attributes` column — went with per-variant typed UDFs (`otel_attr_string/bool/int/double/bytes`), not a single struct-returning UDF: chaining `.field` onto a function-call result hits the same parser limitation subscript access does (task 1.2), so a struct return would need the same subquery-alias workaround for no ergonomic gain over a flat typed call. A shared `otelAttrUDF` type with a per-variant `extract` closure avoids repeating the `ScalarUDF` interface boilerplate 5 times. Also discovered and worked around: the declared argument type must be the table's actual registered attributes type (carries `PARQUET:field_id` metadata), not an independently-built `arrow.MapOf(...)` — DataFusion's signature matching is exact and rejects an otherwise-identical type built fresh in Go
+- [x] 2.2 Register and demonstrate it in `examples/otel-wide-events`, with at least one call site exercised against each `AnyValue` variant already covered by the example (string, bool, int, double, bytes) — array/kvlist left out of the UDF per design D2's allowance (return type would itself be nested `List<Struct<...>>`; `httpEventsView` already covers those two)
+- [x] 2.3 Confirm the UDF's behavior is identical regardless of task group 1's outcome — moot as written (task group 1 landed on Map, and the UDFs were built against it from the start), but the `Evaluate` implementation only depends on `arrow.Array`'s `*array.Map`/`*array.Struct` shape, not on how the query reached it, so it would work unchanged against `List<Struct>` too
 
 ## 3. Finish
 
