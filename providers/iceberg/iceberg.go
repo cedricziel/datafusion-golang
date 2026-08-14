@@ -39,7 +39,7 @@ type tableProvider struct {
 	describe func() string // for error messages, e.g. "metadata.json at ..." or "catalog table db.orders"
 }
 
-func newProvider(ctx context.Context, load func(context.Context) (*table.Table, error), describe func() string) (datafusion.TableProvider, error) {
+func newProvider(ctx context.Context, load func(context.Context) (*table.Table, error), describe func() string) (*tableProvider, error) {
 	tbl, err := load(ctx)
 	if err != nil {
 		return nil, err
@@ -75,6 +75,12 @@ func NewTableProvider(ctx context.Context, metadataLocation string) (datafusion.
 // Unlike NewTableProvider, a provider constructed this way re-resolves the
 // table through the catalog on every scan, so a commit made to the table
 // between two scans becomes visible without reconstructing the provider.
+//
+// The returned provider also implements datafusion.WritableTableProvider
+// (design D4 of wire-parquet-and-iceberg-insert): a catalog is required to
+// commit an insert, so only catalog-backed tables are writable —
+// NewTableProvider's metadata-location tables stay read-only, since a
+// pinned metadata.json path has no channel to observe a new snapshot.
 func NewTableProviderFromCatalog(ctx context.Context, cat catalog.Catalog, identifier ...string) (datafusion.TableProvider, error) {
 	ident := table.Identifier(identifier)
 	load := func(ctx context.Context) (*table.Table, error) {
@@ -84,7 +90,11 @@ func NewTableProviderFromCatalog(ctx context.Context, cat catalog.Catalog, ident
 		}
 		return tbl, nil
 	}
-	return newProvider(ctx, load, func() string { return "catalog table " + strings.Join(identifier, ".") })
+	base, err := newProvider(ctx, load, func() string { return "catalog table " + strings.Join(identifier, ".") })
+	if err != nil {
+		return nil, err
+	}
+	return &writableTableProvider{tableProvider: base, cat: cat, ident: ident}, nil
 }
 
 func (t *tableProvider) Schema() *arrow.Schema { return t.schema }
