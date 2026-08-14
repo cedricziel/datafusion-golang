@@ -373,3 +373,37 @@ func TestRegisterAndQueryViaSQL(t *testing.T) {
 		t.Fatalf("unexpected names: %v", names)
 	}
 }
+
+// TestInsertIntoFailsCleanly pins down add-table-provider-insert's stated
+// behavior for a provider that doesn't opt into WritableTableProvider:
+// unchanged by that change, but the engine's error message should be a
+// clear "does not support INSERT" rather than a generic planning failure.
+func TestInsertIntoFailsCleanly(t *testing.T) {
+	schema := peopleSchema()
+	batch := peopleBatch(t, schema, []int64{1, 2}, []string{"alice", "bob"})
+	defer batch.Release()
+	metaLoc := newIcebergFixture(t, "people", schema, batch)
+
+	p, err := provider.NewTableProvider(context.Background(), metaLoc)
+	if err != nil {
+		t.Fatalf("NewTableProvider: %v", err)
+	}
+
+	ctx, err := datafusion.NewSessionContext()
+	if err != nil {
+		t.Fatalf("NewSessionContext: %v", err)
+	}
+	defer ctx.Close()
+
+	if err := ctx.RegisterTable("people", p); err != nil {
+		t.Fatalf("RegisterTable: %v", err)
+	}
+
+	_, err = ctx.SQL("INSERT INTO people VALUES (3, 'carol')")
+	if err == nil {
+		t.Fatalf("expected INSERT against a read-only iceberg provider to fail")
+	}
+	if !strings.Contains(err.Error(), "does not support INSERT") {
+		t.Fatalf("expected a clear 'does not support INSERT' message, got: %v", err)
+	}
+}
