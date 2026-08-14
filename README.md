@@ -450,6 +450,21 @@ Iceberg-backed table and joins across them in one query:
 go run ./examples/parquet-iceberg
 ```
 
+`examples/otel-wide-events` demonstrates a separate physical/logical schema
+split for OpenTelemetry-shaped data: a Parquet-backed wide-events table
+whose `attributes` column physically encodes OTel's `AnyValue` (a
+struct-of-nullable-typed-columns per variant, nested in a list of
+`{key, value}` pairs — no native Arrow union plays well with Parquet), plus
+a `CREATE VIEW` that unnests and pivots specific attributes into flat,
+semantic-convention-conformant columns (quoted dotted names like
+`"http.request.method"`). It also shows a new event landing in the
+physical table via `INSERT INTO ... SELECT` from another registered
+provider and immediately appearing through the logical view:
+
+```sh
+go run ./examples/otel-wide-events
+```
+
 ## Architecture
 
 ```
