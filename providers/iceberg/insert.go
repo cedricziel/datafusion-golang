@@ -78,17 +78,19 @@ func (t *writableTableProvider) InsertInto(ctx context.Context, op datafusion.In
 		return 0, fmt.Errorf("iceberg: loading %s for insert: %w", t.describe(), err)
 	}
 
+	verb := "append to"
 	if err := commitOffCgoCallbackThread(func() error {
 		var err error
 		switch op {
 		case datafusion.InsertAppend:
 			_, err = tbl.Append(ctx, wrapped, nil)
 		case datafusion.InsertOverwrite:
+			verb = "overwrite"
 			_, err = tbl.Overwrite(ctx, wrapped, nil)
 		}
 		return err
 	}); err != nil {
-		return 0, fmt.Errorf("iceberg: %s %s: %w", commitVerb(op), t.describe(), err)
+		return 0, fmt.Errorf("iceberg: %s %s: %w", verb, t.describe(), err)
 	}
 
 	return wrapped.rowsConsumed(), nil
@@ -103,17 +105,20 @@ func (t *writableTableProvider) InsertInto(ctx context.Context, op datafusion.In
 // callback's duration — a locking state those coroutines can't tolerate,
 // causing a runtime fatal error ("coro: OS thread locking must match
 // locking at coroutine creation"). A plain goroutine has no such pinning.
+//
+// This is the same hazard readerFromSeq (reader.go) works around on the
+// read path — iceberg-go's Scan and Append/Overwrite both sit on
+// iter.Pull-based coroutines, so both a Go-callback-invoked scan and a
+// Go-callback-invoked insert can hit it. The two fixes have different
+// shapes because the hazard windows differ: a scan's danger persists
+// across every RecordReader.Next() call, made from later, separate cgo
+// callbacks readerFromSeq's producer goroutine must outlive, while an
+// insert's whole risk window is this one synchronous call — so a
+// call-and-wait hop is sufficient here, no persistent pump needed.
 func commitOffCgoCallbackThread(commit func() error) error {
 	errCh := make(chan error, 1)
 	go func() { errCh <- commit() }()
 	return <-errCh
-}
-
-func commitVerb(op datafusion.InsertOp) string {
-	if op == datafusion.InsertOverwrite {
-		return "overwrite"
-	}
-	return "append to"
 }
 
 // fieldIDStrippingReader wraps an array.RecordReader, presenting every

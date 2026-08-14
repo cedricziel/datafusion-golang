@@ -8,30 +8,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/cedricziel/datafusion-golang/datafusion"
 	provider "github.com/cedricziel/datafusion-golang/providers/iceberg"
+	"github.com/cedricziel/datafusion-golang/providers/internal/providertest"
 )
-
-// countResult reads the single uint64 count row DataFusion returns for a
-// DML statement's result.
-func countResult(t *testing.T, reader array.RecordReader) uint64 {
-	t.Helper()
-	defer reader.Release()
-	if !reader.Next() {
-		t.Fatalf("expected one DML result batch")
-	}
-	rec := reader.RecordBatch()
-	col, ok := rec.Column(0).(*array.Uint64)
-	if !ok {
-		t.Fatalf("expected count column to be uint64, got %T", rec.Column(0))
-	}
-	if col.Len() != 1 {
-		t.Fatalf("expected a single count row, got %d", col.Len())
-	}
-	v := col.Value(0)
-	if err := reader.Err(); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	return v
-}
 
 func TestInsertInto_SQL_ValuesThenSelectSeesRows(t *testing.T) {
 	schema := peopleSchema()
@@ -56,7 +34,7 @@ func TestInsertInto_SQL_ValuesThenSelectSeesRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("INSERT: %v", err)
 	}
-	if got := countResult(t, reader); got != 1 {
+	if got := providertest.CountResult(t, reader); got != 1 {
 		t.Fatalf("expected count=1, got %d", got)
 	}
 
@@ -108,7 +86,7 @@ func TestInsertInto_SQL_SelectFromAnotherRegisteredTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("INSERT: %v", err)
 	}
-	if got := countResult(t, reader); got != 2 {
+	if got := providertest.CountResult(t, reader); got != 2 {
 		t.Fatalf("expected count=2, got %d", got)
 	}
 
@@ -148,7 +126,7 @@ func TestInsertInto_SQL_ColumnSubsetFillsOmittedWithNull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("INSERT: %v", err)
 	}
-	if got := countResult(t, reader); got != 1 {
+	if got := providertest.CountResult(t, reader); got != 1 {
 		t.Fatalf("expected count=1, got %d", got)
 	}
 
@@ -189,7 +167,7 @@ func TestInsertInto_SQL_Overwrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("INSERT OVERWRITE: %v", err)
 	}
-	if got := countResult(t, reader); got != 1 {
+	if got := providertest.CountResult(t, reader); got != 1 {
 		t.Fatalf("expected count=1, got %d", got)
 	}
 

@@ -18,6 +18,12 @@ import (
 // resumed from other engine threads, which the Go runtime forbids
 // ("coro: OS thread locking must match locking at coroutine creation").
 // A plain goroutine plus channel has no thread affinity.
+//
+// insert.go's commitOffCgoCallbackThread works around the same class of
+// hazard on the write path (Table.Append/Overwrite also sit on
+// iter.Pull-based coroutines), with a simpler call-and-wait shape since an
+// insert's whole risk window is one synchronous call rather than a stream
+// of later, separate callbacks.
 type seqReader struct {
 	schema   *arrow.Schema
 	ch       <-chan seqItem

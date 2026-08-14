@@ -16,7 +16,25 @@ import (
 	"github.com/apache/iceberg-go/table"
 	"github.com/cedricziel/datafusion-golang/datafusion"
 	provider "github.com/cedricziel/datafusion-golang/providers/iceberg"
+	"github.com/cedricziel/datafusion-golang/providers/internal/providertest"
 )
+
+// newTestHadoopCatalog creates a fresh Hadoop catalog under a temp
+// warehouse with the "default" namespace ready to create tables in — the
+// catalog-bootstrap steps newIcebergCatalogFixture (iceberg_test.go) and
+// newPartitionedWritableFixture both need before diverging on schema/spec.
+func newTestHadoopCatalog(t *testing.T) *hadoop.Catalog {
+	t.Helper()
+	warehouse := t.TempDir()
+	hcat, err := hadoop.NewCatalog("test", warehouse, nil)
+	if err != nil {
+		t.Fatalf("hadoop.NewCatalog: %v", err)
+	}
+	if err := hcat.CreateNamespace(context.Background(), []string{"default"}, nil); err != nil {
+		t.Fatalf("CreateNamespace: %v", err)
+	}
+	return hcat
+}
 
 // newPartitionedWritableFixture builds a real Iceberg table
 // identity-partitioned on "part", seeded with one row per partition in
@@ -30,14 +48,7 @@ func newPartitionedWritableFixture(t *testing.T) (cat catalog.Catalog, ident []s
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
 	}, nil)
 
-	warehouse := t.TempDir()
-	hcat, err := hadoop.NewCatalog("test", warehouse, nil)
-	if err != nil {
-		t.Fatalf("hadoop.NewCatalog: %v", err)
-	}
-	if err := hcat.CreateNamespace(ctx, []string{"default"}, nil); err != nil {
-		t.Fatalf("CreateNamespace: %v", err)
-	}
+	hcat := newTestHadoopCatalog(t)
 	icebergSchema, err := table.ArrowSchemaToIcebergWithFreshIDs(sc, false)
 	if err != nil {
 		t.Fatalf("ArrowSchemaToIcebergWithFreshIDs: %v", err)
@@ -80,47 +91,6 @@ func newPartitionedWritableFixture(t *testing.T) (cat catalog.Catalog, ident []s
 	return hcat, ident
 }
 
-// errAfterReader wraps a RecordReader and fails after successfully
-// yielding failAfter batches, so tests can inject a mid-stream failure at
-// a specific point without a real broken data source.
-type errAfterReader struct {
-	array.RecordReader
-	failAfter int
-	calls     int
-	err       error
-}
-
-func (r *errAfterReader) Next() bool {
-	if r.calls >= r.failAfter {
-		r.err = errors.New("injected read failure")
-		return false
-	}
-	ok := r.RecordReader.Next()
-	if ok {
-		r.calls++
-	}
-	return ok
-}
-
-func (r *errAfterReader) Err() error {
-	if r.err != nil {
-		return r.err
-	}
-	return r.RecordReader.Err()
-}
-
-func newRowsReader(t *testing.T, schema *arrow.Schema, batches ...arrow.RecordBatch) array.RecordReader {
-	t.Helper()
-	for _, b := range batches {
-		b.Retain()
-	}
-	rdr, err := array.NewRecordReader(schema, batches)
-	if err != nil {
-		t.Fatalf("NewRecordReader: %v", err)
-	}
-	return rdr
-}
-
 func newWritableProvider(t *testing.T, cat catalog.Catalog, ident []string) interface {
 	datafusion.TableProvider
 	datafusion.WritableTableProvider
@@ -161,8 +131,7 @@ func currentSnapshotID(t *testing.T, cat catalog.Catalog, ident []string) int64 
 // whether the write itself succeeded.
 type failingCommitCatalog struct {
 	catalog.Catalog
-	metadataLocation string
-	commitErr        error
+	commitErr error
 }
 
 func (f *failingCommitCatalog) LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error) {
@@ -170,7 +139,6 @@ func (f *failingCommitCatalog) LoadTable(ctx context.Context, ident table.Identi
 	if err != nil {
 		return nil, err
 	}
-	f.metadataLocation = tbl.MetadataLocation()
 	return table.NewFromLocation(ctx, ident, tbl.MetadataLocation(), tbl.FS, f)
 }
 
@@ -186,7 +154,7 @@ func TestInsertInto_RejectsReplace(t *testing.T) {
 	before := currentSnapshotID(t, cat, ident)
 
 	p := newWritableProvider(t, cat, ident)
-	rows := newRowsReader(t, schema, peopleBatch(t, schema, []int64{2}, []string{"bob"}))
+	rows := providertest.NewRowsReader(t, schema, peopleBatch(t, schema, []int64{2}, []string{"bob"}))
 	if _, err := p.InsertInto(context.Background(), datafusion.InsertReplace, rows); err == nil {
 		t.Fatalf("expected Replace to be rejected")
 	}
@@ -244,8 +212,8 @@ func TestInsertInto_FailingReaderLeavesSnapshotUnchanged(t *testing.T) {
 			defer b1.Release()
 			b2 := peopleBatch(t, schema, []int64{3}, []string{"carol"})
 			defer b2.Release()
-			inner := newRowsReader(t, schema, b1, b2)
-			rows := &errAfterReader{RecordReader: inner, failAfter: failAfter}
+			inner := providertest.NewRowsReader(t, schema, b1, b2)
+			rows := &providertest.ErrAfterReader{RecordReader: inner, FailAfter: failAfter}
 
 			if _, err := p.InsertInto(context.Background(), datafusion.InsertAppend, rows); err == nil {
 				t.Fatalf("expected the injected read failure to abort the insert")
@@ -276,7 +244,7 @@ func TestInsertInto_CommitFailureLeavesTableUnchanged(t *testing.T) {
 	failing := &failingCommitCatalog{Catalog: realCat, commitErr: errors.New("commit rejected")}
 	p := newWritableProvider(t, failing, ident)
 
-	rows := newRowsReader(t, schema, peopleBatch(t, schema, []int64{2}, []string{"bob"}))
+	rows := providertest.NewRowsReader(t, schema, peopleBatch(t, schema, []int64{2}, []string{"bob"}))
 	if _, err := p.InsertInto(context.Background(), datafusion.InsertAppend, rows); err == nil {
 		t.Fatalf("expected the commit failure to fail the insert")
 	}
@@ -301,7 +269,7 @@ func TestInsertInto_AppendThenScanReturnsCombinedRows(t *testing.T) {
 	cat, ident := newIcebergCatalogFixture(t, "people", schema, batch)
 
 	p := newWritableProvider(t, cat, ident)
-	rows := newRowsReader(t, schema, peopleBatch(t, schema, []int64{2}, []string{"bob"}))
+	rows := providertest.NewRowsReader(t, schema, peopleBatch(t, schema, []int64{2}, []string{"bob"}))
 	count, err := p.InsertInto(context.Background(), datafusion.InsertAppend, rows)
 	if err != nil {
 		t.Fatalf("InsertInto: %v", err)
@@ -334,7 +302,7 @@ func TestInsertInto_OverwriteThenScanReturnsReplacedRows(t *testing.T) {
 	cat, ident := newIcebergCatalogFixture(t, "people", schema, batch)
 
 	p := newWritableProvider(t, cat, ident)
-	rows := newRowsReader(t, schema, peopleBatch(t, schema, []int64{9}, []string{"zed"}))
+	rows := providertest.NewRowsReader(t, schema, peopleBatch(t, schema, []int64{9}, []string{"zed"}))
 	count, err := p.InsertInto(context.Background(), datafusion.InsertOverwrite, rows)
 	if err != nil {
 		t.Fatalf("InsertInto: %v", err)
@@ -361,7 +329,7 @@ func TestInsertInto_ZeroRowAppendSkipsCommit(t *testing.T) {
 	before := currentSnapshotID(t, cat, ident)
 
 	p := newWritableProvider(t, cat, ident)
-	rows := newRowsReader(t, schema)
+	rows := providertest.NewRowsReader(t, schema)
 	count, err := p.InsertInto(context.Background(), datafusion.InsertAppend, rows)
 	if err != nil {
 		t.Fatalf("InsertInto: %v", err)
@@ -382,7 +350,7 @@ func TestInsertInto_ZeroRowOverwriteCommitsEmptyTable(t *testing.T) {
 	before := currentSnapshotID(t, cat, ident)
 
 	p := newWritableProvider(t, cat, ident)
-	rows := newRowsReader(t, schema)
+	rows := providertest.NewRowsReader(t, schema)
 	count, err := p.InsertInto(context.Background(), datafusion.InsertOverwrite, rows)
 	if err != nil {
 		t.Fatalf("InsertInto: %v", err)
@@ -437,7 +405,7 @@ func TestInsertInto_FieldIDMetadataOnInputIsIgnored(t *testing.T) {
 			b.Field(1).(*array.StringBuilder).Append("bob")
 			rec := b.NewRecordBatch()
 			b.Release()
-			rows := newRowsReader(t, taggedSchema, rec)
+			rows := providertest.NewRowsReader(t, taggedSchema, rec)
 			rec.Release()
 
 			count, err := p.InsertInto(context.Background(), datafusion.InsertOverwrite, rows)
@@ -473,7 +441,7 @@ func TestInsertInto_PartitionedAppendThenPartitionFilteredScan(t *testing.T) {
 	b.Field(1).(*array.Int64Builder).Append(201)
 	rec := b.NewRecordBatch()
 	b.Release()
-	rows := newRowsReader(t, schema, rec)
+	rows := providertest.NewRowsReader(t, schema, rec)
 	rec.Release()
 
 	count, err := p.InsertInto(context.Background(), datafusion.InsertAppend, rows)
@@ -523,7 +491,7 @@ func TestInsertInto_ConcurrentAppendsBothLand(t *testing.T) {
 	errs := make(chan error, 2)
 	for _, row := range [][2]any{{int64(2), "bob"}, {int64(3), "carol"}} {
 		wg.Go(func() {
-			rows := newRowsReader(t, schema, peopleBatch(t, schema, []int64{row[0].(int64)}, []string{row[1].(string)}))
+			rows := providertest.NewRowsReader(t, schema, peopleBatch(t, schema, []int64{row[0].(int64)}, []string{row[1].(string)}))
 			if _, err := p.InsertInto(context.Background(), datafusion.InsertAppend, rows); err != nil {
 				errs <- err
 			}
@@ -570,7 +538,7 @@ func TestScan_ConcurrentWithInsert_SeesConsistentSnapshot(t *testing.T) {
 			scanCounts <- len(ids)
 		})
 	}
-	rows := newRowsReader(t, schema, peopleBatch(t, schema, []int64{2}, []string{"bob"}))
+	rows := providertest.NewRowsReader(t, schema, peopleBatch(t, schema, []int64{2}, []string{"bob"}))
 	if _, err := p.InsertInto(context.Background(), datafusion.InsertAppend, rows); err != nil {
 		t.Fatalf("InsertInto: %v", err)
 	}

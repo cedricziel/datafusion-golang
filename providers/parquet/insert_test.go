@@ -3,58 +3,16 @@ package parquet_test
 import (
 	"context"
 	"crypto/sha256"
-	"errors"
 	"os"
 	"sync"
 	"testing"
 
-	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/cedricziel/datafusion-golang/datafusion"
+	"github.com/cedricziel/datafusion-golang/providers/internal/providertest"
 	provider "github.com/cedricziel/datafusion-golang/providers/parquet"
 )
-
-// errAfterReader wraps a RecordReader and fails after successfully
-// yielding failAfter batches, so tests can inject a mid-stream failure at
-// a specific point without a real broken data source.
-type errAfterReader struct {
-	array.RecordReader
-	failAfter int
-	calls     int
-	err       error
-}
-
-func (r *errAfterReader) Next() bool {
-	if r.calls >= r.failAfter {
-		r.err = errors.New("injected read failure")
-		return false
-	}
-	ok := r.RecordReader.Next()
-	if ok {
-		r.calls++
-	}
-	return ok
-}
-
-func (r *errAfterReader) Err() error {
-	if r.err != nil {
-		return r.err
-	}
-	return r.RecordReader.Err()
-}
-
-func newRowsReader(t *testing.T, schema *arrow.Schema, batches ...arrow.RecordBatch) array.RecordReader {
-	t.Helper()
-	for _, b := range batches {
-		b.Retain()
-	}
-	rdr, err := array.NewRecordReader(schema, batches)
-	if err != nil {
-		t.Fatalf("NewRecordReader: %v", err)
-	}
-	return rdr
-}
 
 func fileHash(t *testing.T, path string) [32]byte {
 	t.Helper()
@@ -106,7 +64,7 @@ func TestInsertInto_RejectsReplace(t *testing.T) {
 	before := fileHash(t, path)
 
 	p := newWritableProvider(t, path)
-	rows := newRowsReader(t, schema, peopleBatch(t, schema, []int64{2}, []string{"bob"}))
+	rows := providertest.NewRowsReader(t, schema, peopleBatch(t, schema, []int64{2}, []string{"bob"}))
 	_, err := p.InsertInto(context.Background(), datafusion.InsertReplace, rows)
 	if err == nil {
 		t.Fatalf("expected Replace to be rejected")
@@ -133,8 +91,8 @@ func TestInsertInto_FailingReaderLeavesOriginalUnchanged(t *testing.T) {
 			defer b2.Release()
 			b3 := peopleBatch(t, schema, []int64{4}, []string{"dave"})
 			defer b3.Release()
-			inner := newRowsReader(t, schema, b1, b2, b3)
-			rows := &errAfterReader{RecordReader: inner, failAfter: failAfter}
+			inner := providertest.NewRowsReader(t, schema, b1, b2, b3)
+			rows := &providertest.ErrAfterReader{RecordReader: inner, FailAfter: failAfter}
 
 			_, err := p.InsertInto(context.Background(), datafusion.InsertAppend, rows)
 			if err == nil {
@@ -157,7 +115,7 @@ func TestInsertInto_ZeroRowAppendLeavesFileUntouched(t *testing.T) {
 	before := fileHash(t, path)
 
 	p := newWritableProvider(t, path)
-	rows := newRowsReader(t, schema)
+	rows := providertest.NewRowsReader(t, schema)
 	count, err := p.InsertInto(context.Background(), datafusion.InsertAppend, rows)
 	if err != nil {
 		t.Fatalf("InsertInto: %v", err)
@@ -179,7 +137,7 @@ func TestInsertInto_ZeroRowOverwriteProducesEmptyFile(t *testing.T) {
 	path := writeParquetFile(t, dir, "people.parquet", schema, batch)
 
 	p := newWritableProvider(t, path)
-	rows := newRowsReader(t, schema)
+	rows := providertest.NewRowsReader(t, schema)
 	count, err := p.InsertInto(context.Background(), datafusion.InsertOverwrite, rows)
 	if err != nil {
 		t.Fatalf("InsertInto: %v", err)
@@ -215,7 +173,7 @@ func TestInsertInto_SchemaRoundTrips(t *testing.T) {
 	// back before the insert), not the plain schema used to build rows.
 	want := p.Schema()
 
-	rows := newRowsReader(t, schema, peopleBatch(t, schema, []int64{2}, []string{"bob"}))
+	rows := providertest.NewRowsReader(t, schema, peopleBatch(t, schema, []int64{2}, []string{"bob"}))
 	if _, err := p.InsertInto(context.Background(), datafusion.InsertAppend, rows); err != nil {
 		t.Fatalf("InsertInto: %v", err)
 	}
@@ -237,7 +195,7 @@ func TestInsertInto_AppendThenScanReturnsCombinedRows(t *testing.T) {
 	path := writeParquetFile(t, dir, "people.parquet", schema, batch)
 
 	p := newWritableProvider(t, path)
-	rows := newRowsReader(t, schema, peopleBatch(t, schema, []int64{2}, []string{"bob"}))
+	rows := providertest.NewRowsReader(t, schema, peopleBatch(t, schema, []int64{2}, []string{"bob"}))
 	count, err := p.InsertInto(context.Background(), datafusion.InsertAppend, rows)
 	if err != nil {
 		t.Fatalf("InsertInto: %v", err)
@@ -271,7 +229,7 @@ func TestInsertInto_OverwriteThenScanReturnsReplacedRows(t *testing.T) {
 	path := writeParquetFile(t, dir, "people.parquet", schema, batch)
 
 	p := newWritableProvider(t, path)
-	rows := newRowsReader(t, schema, peopleBatch(t, schema, []int64{9}, []string{"zed"}))
+	rows := providertest.NewRowsReader(t, schema, peopleBatch(t, schema, []int64{9}, []string{"zed"}))
 	count, err := p.InsertInto(context.Background(), datafusion.InsertOverwrite, rows)
 	if err != nil {
 		t.Fatalf("InsertInto: %v", err)
@@ -302,7 +260,7 @@ func TestInsertInto_ConcurrentAppendsBothLand(t *testing.T) {
 	errs := make(chan error, 2)
 	for _, row := range [][2]any{{int64(2), "bob"}, {int64(3), "carol"}} {
 		wg.Go(func() {
-			rows := newRowsReader(t, schema, peopleBatch(t, schema, []int64{row[0].(int64)}, []string{row[1].(string)}))
+			rows := providertest.NewRowsReader(t, schema, peopleBatch(t, schema, []int64{row[0].(int64)}, []string{row[1].(string)}))
 			if _, err := p.InsertInto(context.Background(), datafusion.InsertAppend, rows); err != nil {
 				errs <- err
 			}
@@ -337,7 +295,7 @@ func TestInsertInto_ScanOpenedBeforeInsertReadsPreInsertContents(t *testing.T) {
 		t.Fatalf("Scan: %v", err)
 	}
 
-	rows := newRowsReader(t, schema, peopleBatch(t, schema, []int64{2}, []string{"bob"}))
+	rows := providertest.NewRowsReader(t, schema, peopleBatch(t, schema, []int64{2}, []string{"bob"}))
 	if _, err := p.InsertInto(context.Background(), datafusion.InsertAppend, rows); err != nil {
 		t.Fatalf("InsertInto: %v", err)
 	}
@@ -372,7 +330,7 @@ func TestInsertInto_PushdownAgreesWithFullScanAfterRewrite(t *testing.T) {
 	}
 	rec := b.NewRecordBatch()
 	b.Release()
-	rows := newRowsReader(t, schema, rec)
+	rows := providertest.NewRowsReader(t, schema, rec)
 	rec.Release()
 
 	if _, err := p.InsertInto(context.Background(), datafusion.InsertAppend, rows); err != nil {
