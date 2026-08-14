@@ -28,6 +28,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	pqparquet "github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
+	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/hadoop"
 	"github.com/apache/iceberg-go/catalog/rest"
 	icebergtable "github.com/apache/iceberg-go/table"
@@ -45,7 +46,7 @@ func main() {
 	defer os.RemoveAll(dir)
 
 	productsPath := writeProductsParquet(dir)
-	ordersMetaLoc := writeOrdersIceberg(ctx, dir)
+	ordersMetaLoc, ordersCat := writeOrdersIceberg(ctx, dir)
 
 	sess, err := datafusion.NewSessionContext()
 	if err != nil {
@@ -83,6 +84,57 @@ func main() {
 		fmt.Println(reader.RecordBatch())
 	}
 	if err := reader.Err(); err != nil {
+		log.Fatalf("reading result: %v", err)
+	}
+
+	// providers/parquet also implements WritableTableProvider: INSERT INTO
+	// rewrites the backing file atomically (temp file + fsync + rename),
+	// so the new row is visible to every scan that follows.
+	insertReader, err := sess.SQL("INSERT INTO products VALUES (4, 'sprocket')")
+	if err != nil {
+		log.Fatalf("INSERT INTO products: %v", err)
+	}
+	insertReader.Release()
+
+	afterInsert, err := sess.SQL("SELECT name FROM products ORDER BY id")
+	if err != nil {
+		log.Fatalf("SQL: %v", err)
+	}
+	defer afterInsert.Release()
+	for afterInsert.Next() {
+		fmt.Println(afterInsert.RecordBatch())
+	}
+	if err := afterInsert.Err(); err != nil {
+		log.Fatalf("reading result: %v", err)
+	}
+
+	// providers/iceberg's WritableTableProvider needs a catalog to commit
+	// through — only NewTableProviderFromCatalog is writable, so this
+	// reopens the same table via the Hadoop catalog that created it
+	// (ordersCat), rather than through the read-only metadata.json path
+	// used for orders above.
+	ordersWritable, err := icebergprovider.NewTableProviderFromCatalog(ctx, ordersCat, "default", "orders")
+	if err != nil {
+		log.Fatalf("iceberg.NewTableProviderFromCatalog: %v", err)
+	}
+	if err := sess.RegisterTable("orders_writable", ordersWritable); err != nil {
+		log.Fatalf("RegisterTable(orders_writable): %v", err)
+	}
+	insertOrdersReader, err := sess.SQL("INSERT INTO orders_writable VALUES (2, 3)")
+	if err != nil {
+		log.Fatalf("INSERT INTO orders_writable: %v", err)
+	}
+	insertOrdersReader.Release()
+
+	afterOrdersInsert, err := sess.SQL("SELECT COUNT(*) FROM orders_writable")
+	if err != nil {
+		log.Fatalf("SQL: %v", err)
+	}
+	defer afterOrdersInsert.Release()
+	for afterOrdersInsert.Next() {
+		fmt.Println(afterOrdersInsert.RecordBatch())
+	}
+	if err := afterOrdersInsert.Err(); err != nil {
 		log.Fatalf("reading result: %v", err)
 	}
 
@@ -197,8 +249,10 @@ func ordersSchema() *arrow.Schema {
 
 // writeOrdersIceberg creates a small local Iceberg table under dir using
 // iceberg-go's own Hadoop (catalog-less, filesystem-only) catalog and
-// write path, and returns its metadata.json location.
-func writeOrdersIceberg(ctx context.Context, dir string) string {
+// write path, and returns its metadata.json location plus the catalog
+// itself, so callers can also open the table through
+// NewTableProviderFromCatalog (the writable path — see main).
+func writeOrdersIceberg(ctx context.Context, dir string) (metadataLocation string, cat catalog.Catalog) {
 	schema := ordersSchema()
 	b := array.NewRecordBuilder(memory.DefaultAllocator, schema)
 	defer b.Release()
@@ -241,5 +295,5 @@ func writeOrdersIceberg(ctx context.Context, dir string) string {
 		log.Fatalf("Append: %v", err)
 	}
 
-	return tbl.MetadataLocation()
+	return tbl.MetadataLocation(), cat
 }

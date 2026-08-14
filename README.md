@@ -245,8 +245,9 @@ err := ctx.RegisterTable("events", table) // table also implements WritableTable
 reader, err := ctx.SQL("INSERT INTO events VALUES (1, 'signed_up')")
 ```
 
-`providers/parquet` and `providers/iceberg` do not yet implement this
-interface — see [Roadmap](#roadmap).
+Both built-in providers implement this interface — see their sections
+under [Built-in table providers](#built-in-table-providers) for exactly
+which modes each supports and what each mode costs.
 
 ### Contracts and limitations
 
@@ -307,6 +308,33 @@ matching row, and a limit hint stops the scan early. Skipping is strictly
 one-directional — a row group is only skipped when the metadata *proves*
 no row can match; missing or inconclusive statistics always keep it — so
 query results are identical with and without pruning.
+
+**Writes:** the provider also implements `WritableTableProvider`, supporting
+`INSERT INTO` (append) and `INSERT OVERWRITE`; `REPLACE INTO` is rejected
+with a clear error. Parquet's footer-at-end format has no API to append to
+a closed file, so every insert — append or overwrite — rewrites the whole
+table: a complete new file is written to a `<name>.tmp-<random>` temp file
+in the same directory (append streams the existing rows first, then the
+new ones; overwrite streams only the new ones), then `fsync` and
+`os.Rename` atomically replace the original. A failure at any point —
+reading the input, writing, or closing — deletes the temp file and leaves
+the original byte-identical; only the rename commits. This makes append
+an O(table size) operation per insert, inherent to the format, not a
+shortcut taken here; workloads with frequent small appends are a better
+fit for `providers/iceberg`. Concurrent inserts on the same provider
+instance are serialized by an internal mutex so two rewrites can never
+race the rename; scans never take this lock — one opened before an insert
+completes reads the file's pre-insert contents to completion (the old
+inode, per POSIX rename semantics), one opened after reads the new file.
+Rewriting does not preserve the original file's encoding details
+(compression codec, bloom filters) — data is preserved exactly, but a
+rewritten file loses whatever bloom filters it had, which affects future
+scan pruning *effectiveness*, never correctness.
+
+```go
+_, err = ctx.SQL("INSERT INTO people VALUES (3, 'carol')")
+reader, err := ctx.SQL("SELECT * FROM people")
+```
 
 ### `providers/iceberg`
 
@@ -369,6 +397,46 @@ projection is pushed via selected fields so only the needed columns are
 read, and the limit hint is passed through. A filter that cannot be
 converted faithfully is dropped whole (never approximated), so pushed
 filters can only ever widen the scan — results are identical either way.
+
+**Writes:** only a catalog-backed provider (`NewTableProviderFromCatalog`)
+implements `WritableTableProvider`; the metadata.json path
+(`NewTableProvider`) stays read-only, expressed in the type system rather
+than as a runtime error — committing a snapshot requires a catalog to
+record the new metadata location, which a table pinned to one
+`metadata.json` file has no way to observe anyway. Callers who want
+catalog-less local writes use `NewTableProviderFromCatalog` with
+[`catalog/hadoop`](https://pkg.go.dev/github.com/apache/iceberg-go/catalog/hadoop)
+— filesystem-backed, no catalog service required, the same fixture this
+repo's own tests write against:
+
+```go
+import "github.com/apache/iceberg-go/catalog/hadoop"
+
+cat, err := hadoop.NewCatalog("local", "/path/to/warehouse", nil)
+table, err := icebergprovider.NewTableProviderFromCatalog(ctx, cat, "db", "orders")
+err = ctx.RegisterTable("orders", table)
+
+_, err = ctx.SQL("INSERT INTO orders VALUES (1, 'first')")
+reader, err := ctx.SQL("SELECT * FROM orders")
+```
+
+`INSERT INTO` and `INSERT OVERWRITE` are supported, backed by iceberg-go's
+own `Table.Append` / `Table.Overwrite`; `REPLACE INTO` is rejected.
+`INSERT OVERWRITE` deletes all existing data files and adds the new data
+in one commit — the whole table's history-of-snapshots keeps the deleted
+data reachable until it's expired, unlike Parquet's overwrite which is
+gone once the old file is replaced. Each insert loads a fresh table
+handle from the catalog (never a cached one) and commits through
+iceberg-go's own machinery, which supplies atomicity (the current
+snapshot is untouched until the metadata swap succeeds), commit-conflict
+retries, and partitioned-write routing. A concurrent scan is
+snapshot-isolated by construction — it always reads one specific
+snapshot's data files to completion, so it never observes a torn mix of
+pre- and post-commit rows, regardless of when an insert commits relative
+to the scan. Inserts on the same provider instance are serialized by an
+internal mutex — not required for correctness (the catalog arbitrates
+commits), but it avoids same-instance inserts burning iceberg-go's own
+commit-retry budget racing each other.
 
 **Scope boundaries (both providers):** local filesystem only — no S3,
 GCS, or Azure object stores. Iceberg catalog services are no longer
@@ -439,7 +507,6 @@ The FFI, memory-ownership, callback, and threading conventions are
 established; later phases build on them:
 
 - Aggregate and window UDFs
-- Writable `providers/parquet` and `providers/iceberg` (the engine-level `WritableTableProvider` capability already exists; wiring the two built-in providers to it is planned follow-up work)
 - Cancellation (`context.Context`) wiring for scans and queries
 - Planner/optimizer hooks
 - Prebuilt binary distribution (no local Rust toolchain required)
