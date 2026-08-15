@@ -275,6 +275,44 @@ which modes each supports and what each mode costs.
   no variadic or generic functions, and volatility is fixed to `Volatile`
   (never constant-folded).
 
+## Object storage backends
+
+`providers/parquet`, `providers/csv`, `providers/json`, and `providers/jsonl`
+all read and write through the `objectstore` package, so any of them can be
+pointed at a bare local path, a `file://` URL, an in-memory `mem://` location
+(handy for tests — no filesystem or network I/O), or a cloud URL, uniformly:
+
+```go
+import "github.com/cedricziel/datafusion-golang/objectstore"
+_ "github.com/cedricziel/datafusion-golang/objectstore/s3"     // enables s3://
+_ "github.com/cedricziel/datafusion-golang/objectstore/gcs"    // enables gs://
+_ "github.com/cedricziel/datafusion-golang/objectstore/azure"  // enables azblob://
+```
+
+Local and `mem://` need no import — they're built into `objectstore`. Each
+cloud scheme is opt-in: import its subpackage for the side effect of
+registering the scheme (`database/sql`-driver style), and only that
+package's SDK dependencies are linked into your binary.
+
+Cloud credentials resolve through the storage SDK's standard chain — for S3,
+`AWS_ACCESS_KEY_ID`/`AWS_PROFILE`/shared config/IMDS, the same as the AWS
+CLI. Connection details can be overridden per location via URL query
+parameters, e.g. for an S3-compatible endpoint like MinIO:
+
+```
+s3://my-bucket/data.parquet?endpoint=http://localhost:9000&use_path_style=true&region=us-east-1
+```
+
+Reads are ranged (`io.ReaderAt`), so Parquet's pushdown pruning skips network
+bytes on a cloud backend the same way it skips disk reads locally — pruned
+row groups are never fetched. Writes commit atomically per object (a reader
+sees the complete prior object or the complete new one, never a mix), but
+there is no cross-process write coordination: two external writers racing to
+overwrite the same cloud object are last-writer-wins, and the losing write's
+rows are silently absent. This is a change from a local-only setup only in
+the *cross-process* case — a single provider instance's own concurrent
+inserts are still serialized internally either way.
+
 ## Built-in table providers
 
 Two ready-made `datafusion.TableProvider` implementations ship as separate,
@@ -315,20 +353,23 @@ query results are identical with and without pruning.
 `INSERT INTO` (append) and `INSERT OVERWRITE`; `REPLACE INTO` is rejected
 with a clear error. Parquet's footer-at-end format has no API to append to
 a closed file, so every insert — append or overwrite — rewrites the whole
-table: a complete new file is written to a `<name>.tmp-<random>` temp file
-in the same directory (append streams the existing rows first, then the
-new ones; overwrite streams only the new ones), then `fsync` and
-`os.Rename` atomically replace the original. A failure at any point —
-reading the input, writing, or closing — deletes the temp file and leaves
-the original byte-identical; only the rename commits. This makes append
-an O(table size) operation per insert, inherent to the format, not a
+table: a complete new object is written through the `objectstore` backend's
+commit-on-Close `Writer` (append streams the existing rows first, then the
+new ones; overwrite streams only the new ones). On the local backend this is
+still exactly a `<name>.tmp-<random>` temp file in the same directory,
+`fsync`, then `os.Rename` — object stores commit via a single PUT instead;
+see [Object storage backends](#object-storage-backends) for what each
+backend family guarantees. A failure at any point — reading the input,
+writing, or finalizing — aborts the write and leaves the original object
+byte-identical; only a successful commit publishes the new one. This makes
+append an O(table size) operation per insert, inherent to the format, not a
 shortcut taken here; workloads with frequent small appends are a better
 fit for `providers/iceberg`. Concurrent inserts on the same provider
 instance are serialized by an internal mutex so two rewrites can never
-race the rename; scans never take this lock — one opened before an insert
-completes reads the file's pre-insert contents to completion (the old
-inode, per POSIX rename semantics), one opened after reads the new file.
-Rewriting does not preserve the original file's encoding details
+race the commit; scans never take this lock — one opened before an insert
+completes reads the object's pre-insert contents to completion, one opened
+after reads the new object. Rewriting does not preserve the original file's
+encoding details
 (compression codec, bloom filters) — data is preserved exactly, but a
 rewritten file loses whatever bloom filters it had, which affects future
 scan pruning *effectiveness*, never correctness.
