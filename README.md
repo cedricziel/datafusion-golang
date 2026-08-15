@@ -294,13 +294,21 @@ cloud scheme is opt-in: import its subpackage for the side effect of
 registering the scheme (`database/sql`-driver style), and only that
 package's SDK dependencies are linked into your binary.
 
-Cloud credentials resolve through the storage SDK's standard chain — for S3,
-`AWS_ACCESS_KEY_ID`/`AWS_PROFILE`/shared config/IMDS, the same as the AWS
-CLI. Connection details can be overridden per location via URL query
+Cloud credentials resolve through each storage SDK's standard chain — for
+S3, `AWS_ACCESS_KEY_ID`/`AWS_PROFILE`/shared config/IMDS, the same as the
+AWS CLI; for GCS, Application Default Credentials (environment, workload
+identity, or `gcloud auth application-default login`), the same as
+`gcloud`. Connection details can be overridden per location via URL query
 parameters, e.g. for an S3-compatible endpoint like MinIO:
 
 ```
 s3://my-bucket/data.parquet?endpoint=http://localhost:9000&use_path_style=true&region=us-east-1
+```
+
+or a local GCS-compatible endpoint like fake-gcs-server:
+
+```
+gs://my-bucket/data.parquet?endpoint=http://localhost:4443
 ```
 
 Reads are ranged (`io.ReaderAt`), so Parquet's pushdown pruning skips network
