@@ -44,13 +44,15 @@
 // realistic ingestion shape besides, since event batches arrive as Arrow
 // data, not hand-typed SQL.
 //
-// attr_udf.go demonstrates a second way to read attributes: Go ScalarUDFs
-// (otel_attr_string/bool/int/double/bytes) that extract one named
-// attribute's value directly, callable from SQL with no view or subscript
+// attr_udf.go demonstrates a second way to read attributes: a Go
+// ScalarUDF, otel_http_attrs, that extracts httpEventsView's 5 scalar
+// attributes directly, callable from SQL with no view or subscript
 // access at all. This needs no engine changes — scalar UDF registration
 // already exists — and works purely by walking the attributes column's
 // Arrow value in Go, so it is agnostic to the SQL-level access pattern
-// httpEventsView uses.
+// httpEventsView uses. It scans each row's attribute list exactly once
+// for all 5 wanted keys together, rather than once per key — see
+// attr_udf.go's doc comment for why that matters.
 package main
 
 import (
@@ -372,20 +374,19 @@ func main() {
 	fmt.Println("--- http_events, after insert ---")
 	printHTTPEvents(sess)
 
-	// Same physical attributes column, read a second way: a Go ScalarUDF
-	// per scalar variant, called directly against wide_events with no
-	// view or subscript access involved (see attr_udf.go).
-	fmt.Println("--- direct attribute extraction via otel_attr_* UDFs ---")
+	// Same physical attributes column, read a second way: a single Go
+	// ScalarUDF called directly against wide_events with no view or
+	// subscript access involved (see attr_udf.go). Its struct result
+	// needs the same alias-then-dot-access step httpEventsView's
+	// subscripts do, for the same reason (DataFusion 54.1.0 rejects
+	// chaining .field directly onto a function-call expression).
+	fmt.Println("--- direct attribute extraction via otel_http_attrs UDF ---")
 	udfReader, err := sess.SQL(`
-		SELECT event_id,
-		       otel_attr_string(attributes, 'http.request.method') AS method,
-		       otel_attr_int(attributes, 'http.response.status_code') AS status_code,
-		       otel_attr_double(attributes, 'http.server.request.duration') AS duration,
-		       otel_attr_bool(attributes, 'error') AS is_error,
-		       otel_attr_bytes(attributes, 'debug.payload_prefix') AS payload_prefix
-		FROM wide_events ORDER BY event_id`)
+		SELECT event_id, h.method, h.status_code, h.duration, h.is_error, h.payload_prefix
+		FROM (SELECT event_id, otel_http_attrs(attributes) AS h FROM wide_events)
+		ORDER BY event_id`)
 	if err != nil {
-		log.Fatalf("SQL (otel_attr_*): %v", err)
+		log.Fatalf("SQL (otel_http_attrs): %v", err)
 	}
 	defer udfReader.Release()
 	for udfReader.Next() {
