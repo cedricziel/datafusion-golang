@@ -1,0 +1,96 @@
+package objectstore_test
+
+import (
+	"context"
+	"errors"
+	"net/url"
+	"testing"
+
+	"github.com/cedricziel/datafusion-golang/objectstore"
+)
+
+func TestResolveBarePathIsLocal(t *testing.T) {
+	store, path, err := objectstore.Resolve(context.Background(), "/data/orders.parquet")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if store != objectstore.Local {
+		t.Fatal("bare path did not resolve to the local backend")
+	}
+	if path != "/data/orders.parquet" {
+		t.Fatalf("path = %q, want %q", path, "/data/orders.parquet")
+	}
+}
+
+func TestResolveFileSchemeIsLocal(t *testing.T) {
+	store, path, err := objectstore.Resolve(context.Background(), "file:///data/orders.parquet")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if store != objectstore.Local {
+		t.Fatal("file:// did not resolve to the local backend")
+	}
+	if path != "/data/orders.parquet" {
+		t.Fatalf("path = %q, want %q", path, "/data/orders.parquet")
+	}
+}
+
+func TestResolveDriveLetterIsLocal(t *testing.T) {
+	store, path, err := objectstore.Resolve(context.Background(), `C:\data\orders.parquet`)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if store != objectstore.Local {
+		t.Fatal("drive-letter path did not resolve to the local backend")
+	}
+	if path != `C:\data\orders.parquet` {
+		t.Fatalf("path = %q, want unchanged drive-letter path", path)
+	}
+}
+
+func TestResolveUnregisteredSchemeFails(t *testing.T) {
+	_, _, err := objectstore.Resolve(context.Background(), "s3://bucket/key")
+	if err == nil {
+		t.Fatal("expected an error for an unregistered scheme")
+	}
+	var unregistered *objectstore.UnregisteredSchemeError
+	if !errors.As(err, &unregistered) {
+		t.Fatalf("error = %v, want an *UnregisteredSchemeError", err)
+	}
+	if unregistered.Scheme != "s3" {
+		t.Fatalf("Scheme = %q, want %q", unregistered.Scheme, "s3")
+	}
+	if got := err.Error(); got == "" {
+		t.Fatal("error message is empty")
+	}
+}
+
+func TestRegisterRejectsReservedSchemes(t *testing.T) {
+	for _, scheme := range []string{"", "file", "c", "Z"} {
+		if err := objectstore.Register(scheme, func(_ context.Context, _ *url.URL) (objectstore.Store, error) {
+			return objectstore.Local, nil
+		}); err == nil {
+			t.Errorf("Register(%q, ...) succeeded, want an error (reserved scheme)", scheme)
+		}
+	}
+}
+
+func TestRegisterCustomOpener(t *testing.T) {
+	const scheme = "custom-test-scheme"
+	called := false
+	objectstore.Register(scheme, func(_ context.Context, u *url.URL) (objectstore.Store, error) {
+		called = true
+		return objectstore.Local, nil
+	})
+
+	store, _, err := objectstore.Resolve(context.Background(), scheme+"://host/key")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if !called {
+		t.Fatal("custom opener was not invoked")
+	}
+	if store != objectstore.Local {
+		t.Fatal("Resolve did not return the store produced by the custom opener")
+	}
+}

@@ -4,10 +4,10 @@ Phases 1–6 are deliberately independent merge units: each leaves `main` green,
 
 ## 1. Phase 1 — objectstore core: interface, registry, local + mem backends
 
-- [ ] 1.1 Create `objectstore` package: `Store`/`Object`/`Writer` interfaces (design D1 sketch), `Register`, and `Resolve` with bare-path/`file://`/drive-letter handling and the actionable unregistered-scheme error (design D2)
-- [ ] 1.2 Implement the local backend over `os`: `Open` returning `*os.File`-backed `Object`, commit-on-Close `Create` via temp-in-dir + fsync + rename (lifted from providers/parquet/insert.go), `Remove`, `List`
-- [ ] 1.3 Implement the mem backend: process-local map, commit-on-Close swap, remove, list; register `mem` scheme
-- [ ] 1.4 Write the shared `objectstoretest` contract suite (open-missing errors, no-read-on-open, ranged reads, commit-on-Close visibility, abort leaves prior state, remove, list) and run it against local and mem
+- [x] 1.1 Create `objectstore` package: `Store`/`Object`/`Writer` interfaces (design D1 sketch), `Register`, and `Resolve` with bare-path/`file://`/drive-letter handling and the actionable unregistered-scheme error (design D2)
+- [x] 1.2 Implement the local backend over `os`: `Open` returning `*os.File`-backed `Object`, commit-on-Close `Create` via temp-in-dir + fsync + rename (lifted from providers/parquet/insert.go), `Remove`, `List`
+- [x] 1.3 Implement the mem backend: process-local map, commit-on-Close swap, remove, list; register `mem` scheme
+- [x] 1.4 Write the shared `objectstoretest` contract suite (open-missing errors, no-read-on-open, ranged reads, commit-on-Close visibility, abort leaves prior state, remove, list) and run it against local and mem
 
 ## 2. Phase 2 — providers on the abstraction (parity refactor + mem coverage)
 
