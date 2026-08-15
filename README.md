@@ -303,19 +303,19 @@ connection string, a SAS token, or `DefaultAzureCredential` (CLI login,
 managed identity). Connection details can be overridden per location via
 URL query parameters, e.g. for an S3-compatible endpoint like MinIO:
 
-```
+```text
 s3://my-bucket/data.parquet?endpoint=http://localhost:9000&use_path_style=true&region=us-east-1
 ```
 
 or a local GCS-compatible endpoint like fake-gcs-server:
 
-```
+```text
 gs://my-bucket/data.parquet?endpoint=http://localhost:4443
 ```
 
 or a local Azure-compatible endpoint like Azurite:
 
-```
+```text
 azblob://my-container/data.parquet?domain=127.0.0.1:10000&protocol=http&storage_account=devstoreaccount1
 ```
 

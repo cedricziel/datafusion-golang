@@ -2,11 +2,14 @@ package parquet_test
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"net/url"
 	"os"
 	"testing"
 
 	"github.com/cedricziel/datafusion-golang/datafusion"
+	"github.com/cedricziel/datafusion-golang/objectstore"
 	_ "github.com/cedricziel/datafusion-golang/objectstore/azure"
 	provider "github.com/cedricziel/datafusion-golang/providers/parquet"
 )
@@ -37,6 +40,33 @@ func azureLocation(t *testing.T, container, key string) string {
 	return u.String()
 }
 
+// uniqueTestSuffix returns a random per-invocation suffix, so concurrent
+// runs of this test (e.g. two CI jobs, or repeated local runs against a
+// persistent container) never race on the same object key.
+func uniqueTestSuffix(t *testing.T) string {
+	t.Helper()
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// removeOnCleanup registers a t.Cleanup that best-effort removes the
+// object at location, so integration test runs don't leave objects
+// behind in a real (non-ephemeral) container.
+func removeOnCleanup(t *testing.T, location string) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx := context.Background()
+		store, path, err := objectstore.Resolve(ctx, location)
+		if err != nil {
+			return
+		}
+		_ = store.Remove(ctx, path)
+	})
+}
+
 // TestAzureIntegration_ScanPushdownAndInsert covers construction,
 // pushdown scan, and INSERT through SQL against a real
 // Azure-Blob-compatible endpoint (task 5.2): the same behavior already
@@ -44,7 +74,8 @@ func azureLocation(t *testing.T, container, key string) string {
 // end.
 func TestAzureIntegration_ScanPushdownAndInsert(t *testing.T) {
 	container := azureTestContainer(t)
-	location := azureLocation(t, container, "azure-integration-"+t.Name()+"/people.parquet")
+	location := azureLocation(t, container, "azure-integration-"+uniqueTestSuffix(t)+"/people.parquet")
+	removeOnCleanup(t, location)
 
 	schema := peopleSchema()
 	batch := peopleBatch(t, schema, []int64{1, 2}, []string{"alice", "bob"})
