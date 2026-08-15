@@ -136,6 +136,41 @@ func TestNewTableProvider_ValidTable(t *testing.T) {
 	}
 }
 
+// TestNewTableProvider_IOPropsOmittedChangesNothing covers the
+// object-store spec's "Omitted properties change nothing" scenario:
+// construction and scans behave identically to a provider constructed
+// with no WithIOProps option.
+func TestNewTableProvider_IOPropsOmittedChangesNothing(t *testing.T) {
+	schema := peopleSchema()
+	batch := peopleBatch(t, schema, []int64{1, 2}, []string{"alice", "bob"})
+	defer batch.Release()
+	metaLoc := newIcebergFixture(t, "people", schema, batch)
+
+	p, err := provider.NewTableProvider(context.Background(), metaLoc, provider.WithIOProps(nil))
+	if err != nil {
+		t.Fatalf("NewTableProvider: %v", err)
+	}
+	if got, want := p.Schema().NumFields(), 2; got != want {
+		t.Fatalf("expected %d fields, got %d", want, got)
+	}
+
+	reader, err := p.Scan(context.Background())
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	defer reader.Release()
+	var rows int
+	for reader.Next() {
+		rows += int(reader.RecordBatch().NumRows())
+	}
+	if err := reader.Err(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rows != 2 {
+		t.Fatalf("expected 2 rows, got %d", rows)
+	}
+}
+
 func TestNewTableProvider_MissingMetadata(t *testing.T) {
 	_, err := provider.NewTableProvider(context.Background(), filepath.Join(t.TempDir(), "does-not-exist", "metadata.json"))
 	if err == nil {

@@ -36,9 +36,9 @@ Phases 1–6 are deliberately independent merge units: each leaves `main` green,
 
 ## 6. Phase 6 — Iceberg cloud wiring
 
-- [ ] 6.1 Add storage-property plumbing to `providers/iceberg` constructors (`WithIOProps` or equivalent) feeding `icebergio.LoadFSFunc(props, …)` and catalog-loaded tables
-- [ ] 6.2 Env-gated integration test: iceberg table on an S3-compatible endpoint (metadata-location read; catalog-backed insert if the harness allows) via blank import of `iceberg-go/io/gocloud`
-- [ ] 6.3 Document enabling cloud schemes for iceberg (blank import, property names, scheme differences: `abfs`/`wasb` vs `azblob`)
+- [x] 6.1 Add storage-property plumbing to `providers/iceberg` constructors (`WithIOProps` or equivalent) feeding `icebergio.LoadFSFunc(props, …)` and catalog-loaded tables
+- [x] 6.2 Env-gated integration test: iceberg table on an S3-compatible endpoint (metadata-location read; catalog-backed insert if the harness allows) via blank import of `iceberg-go/io/gocloud`
+- [x] 6.3 Document enabling cloud schemes for iceberg (blank import, property names, scheme differences: `abfs`/`wasb` vs `azblob`)
 
 ## 7. Wrap-up
 
