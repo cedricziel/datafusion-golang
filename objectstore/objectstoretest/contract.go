@@ -43,7 +43,7 @@ func Run(t *testing.T, newStore Factory) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		defer obj.Close()
+		defer func() { _ = obj.Close() }()
 		if got, want := obj.Size(), int64(len("hello world")); got != want {
 			t.Fatalf("Size() = %d, want %d (available without reading data)", got, want)
 		}
@@ -58,7 +58,7 @@ func Run(t *testing.T, newStore Factory) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		defer obj.Close()
+		defer func() { _ = obj.Close() }()
 
 		buf := make([]byte, 3)
 		n, err := obj.ReadAt(buf, 7)
@@ -176,7 +176,7 @@ func mustRead(t *testing.T, ctx context.Context, store objectstore.Store, path s
 	if err != nil {
 		t.Fatalf("Open(%q): %v", path, err)
 	}
-	defer obj.Close()
+	defer func() { _ = obj.Close() }()
 	var buf bytes.Buffer
 	if _, err := io.Copy(&buf, io.NewSectionReader(obj, 0, obj.Size())); err != nil {
 		t.Fatalf("reading %q: %v", path, err)

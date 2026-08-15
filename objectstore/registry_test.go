@@ -35,6 +35,36 @@ func TestResolveFileSchemeIsLocal(t *testing.T) {
 	}
 }
 
+func TestRegisterAndResolveSingleLetterScheme(t *testing.T) {
+	// x://host/key is a valid URI with a genuine one-character scheme
+	// (url.Parse gives it a non-empty Host) — distinct from a
+	// drive-letter path like C:\data\x, which has no "://" authority and
+	// so an empty Host. A single-letter scheme must be registrable and
+	// must resolve through its own opener, not fall back to local.
+	const scheme = "x"
+	called := false
+	if err := objectstore.Register(scheme, func(_ context.Context, u *url.URL) (objectstore.Store, error) {
+		called = true
+		return objectstore.Local, nil
+	}); err != nil {
+		t.Fatalf("Register(%q, ...): %v", scheme, err)
+	}
+
+	store, path, err := objectstore.Resolve(context.Background(), "x://host/key")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if !called {
+		t.Fatal("registered opener for single-letter scheme was not invoked")
+	}
+	if store != objectstore.Local {
+		t.Fatal("Resolve did not return the store produced by the registered opener")
+	}
+	if path != "key" {
+		t.Fatalf("path = %q, want %q", path, "key")
+	}
+}
+
 func TestResolveDriveLetterIsLocal(t *testing.T) {
 	store, path, err := objectstore.Resolve(context.Background(), `C:\data\orders.parquet`)
 	if err != nil {
@@ -66,7 +96,7 @@ func TestResolveUnregisteredSchemeFails(t *testing.T) {
 }
 
 func TestRegisterRejectsReservedSchemes(t *testing.T) {
-	for _, scheme := range []string{"", "file", "c", "Z"} {
+	for _, scheme := range []string{"", "file"} {
 		if err := objectstore.Register(scheme, func(_ context.Context, _ *url.URL) (objectstore.Store, error) {
 			return objectstore.Local, nil
 		}); err == nil {
@@ -78,10 +108,12 @@ func TestRegisterRejectsReservedSchemes(t *testing.T) {
 func TestRegisterCustomOpener(t *testing.T) {
 	const scheme = "custom-test-scheme"
 	called := false
-	objectstore.Register(scheme, func(_ context.Context, u *url.URL) (objectstore.Store, error) {
+	if err := objectstore.Register(scheme, func(_ context.Context, u *url.URL) (objectstore.Store, error) {
 		called = true
 		return objectstore.Local, nil
-	})
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
 
 	store, _, err := objectstore.Resolve(context.Background(), scheme+"://host/key")
 	if err != nil {

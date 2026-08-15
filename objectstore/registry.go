@@ -37,13 +37,24 @@ var schemeImportHints = map[string]string{
 	"azblob": "github.com/cedricziel/datafusion-golang/objectstore/azure",
 }
 
+// inflightResolve tracks one in-progress Opener call for a cache key, so
+// concurrent Resolve calls for the same key wait for the single call in
+// flight instead of each invoking the Opener themselves.
+type inflightResolve struct {
+	done  chan struct{}
+	store Store
+	err   error
+}
+
 var registry = struct {
-	mu      sync.RWMutex
-	openers map[string]Opener
-	cache   map[string]Store
+	mu       sync.Mutex
+	openers  map[string]Opener
+	cache    map[string]Store
+	inflight map[string]*inflightResolve
 }{
-	openers: make(map[string]Opener),
-	cache:   make(map[string]Store),
+	openers:  make(map[string]Opener),
+	cache:    make(map[string]Store),
+	inflight: make(map[string]*inflightResolve),
 }
 
 // Register associates scheme with opener, enabling locations of the form
@@ -51,9 +62,13 @@ var registry = struct {
 // Register from an init() so that a blank import enables their scheme.
 // Registering the same scheme twice replaces the previous opener and
 // clears any stores already cached for it. Register rejects a scheme
-// Resolve always treats as local (empty, "file", or a drive letter).
+// Resolve always treats as local (empty or "file"); a single-letter
+// scheme is otherwise a perfectly registrable scheme — whether a given
+// location is a drive-letter path or a registered scheme is decided in
+// Resolve by whether the location has a "://" authority, not by the
+// scheme's length.
 func Register(scheme string, opener Opener) error {
-	if isReservedScheme(scheme) {
+	if scheme == "" || scheme == "file" {
 		return fmt.Errorf("objectstore: cannot register reserved scheme %q", scheme)
 	}
 	registry.mu.Lock()
@@ -71,63 +86,81 @@ func Register(scheme string, opener Opener) error {
 // Resolve splits location into a Store and the path within it.
 //
 // A location with no scheme, or with the "file" scheme, resolves to the
-// local backend. A Windows-style drive-letter path (e.g. `C:\data\x`) is
-// treated as a local path, not a URL scheme. Any other scheme is looked
-// up in the registry; if no Opener is registered for it, Resolve returns
-// an *UnregisteredSchemeError.
+// local backend. A Windows-style drive-letter path (e.g. `C:\data\x` or
+// `C:/data/x`) parses with a scheme but no "://" authority — url.Parse
+// leaves its Host empty — and is treated as a local path on that basis,
+// not by scheme length: `x://host/key` is a valid URI with a genuine
+// one-character scheme (Host "host"), and resolves through the registry
+// like any other scheme. Any other scheme is looked up in the registry;
+// if no Opener is registered for it, Resolve returns an
+// *UnregisteredSchemeError.
 func Resolve(ctx context.Context, location string) (Store, string, error) {
 	u, err := url.Parse(location)
-	if err != nil || u.Scheme == "" || isDriveLetter(u.Scheme) {
+	if err != nil || u.Scheme == "" {
 		return Local, location, nil
 	}
 	if u.Scheme == "file" {
 		return Local, u.Path, nil
 	}
+	if u.Host == "" && isDriveLetter(u.Scheme) {
+		return Local, location, nil
+	}
 
 	cacheKey := u.Scheme + "://" + u.Host + "?" + u.RawQuery
 	path := strings.TrimPrefix(u.Path, "/")
 
-	registry.mu.RLock()
-	store, cached := registry.cache[cacheKey]
-	opener, registered := registry.openers[u.Scheme]
-	registry.mu.RUnlock()
-	if cached {
+	registry.mu.Lock()
+	if store, cached := registry.cache[cacheKey]; cached {
+		registry.mu.Unlock()
 		return store, path, nil
 	}
+	if call, inFlight := registry.inflight[cacheKey]; inFlight {
+		registry.mu.Unlock()
+		<-call.done
+		if call.err != nil {
+			return nil, "", call.err
+		}
+		return call.store, path, nil
+	}
+	opener, registered := registry.openers[u.Scheme]
 	if !registered {
+		registry.mu.Unlock()
 		return nil, "", &UnregisteredSchemeError{Scheme: u.Scheme}
 	}
+	call := &inflightResolve{done: make(chan struct{})}
+	registry.inflight[cacheKey] = call
+	registry.mu.Unlock()
 
-	// Hold the write lock across the opener call so two concurrent
-	// first-resolutions of the same scheme+host+query can't both open a
-	// backend and race to cache it — the loser's Store (and whatever
-	// connection/client it holds) would otherwise leak. Openers run once
-	// per distinct key and are cached forever after, so this cost is
-	// paid at most once per bucket/container, not per query.
+	// The Opener runs with no lock held: it may itself call Resolve or
+	// Register (e.g. to compose backends), which would deadlock against
+	// a non-reentrant lock held here. Concurrent Resolve calls for this
+	// same key block on call.done above instead of each invoking the
+	// Opener, so it still runs at most once per key.
+	store, openErr := opener(ctx, u)
+
 	registry.mu.Lock()
-	defer registry.mu.Unlock()
-	if store, cached := registry.cache[cacheKey]; cached {
-		return store, path, nil
+	delete(registry.inflight, cacheKey)
+	if openErr == nil {
+		registry.cache[cacheKey] = store
 	}
-	store, err = opener(ctx, u)
-	if err != nil {
-		return nil, "", fmt.Errorf("objectstore: opening %q: %w", u.Scheme, err)
+	registry.mu.Unlock()
+
+	if openErr != nil {
+		call.err = fmt.Errorf("objectstore: opening %q: %w", u.Scheme, openErr)
+		close(call.done)
+		return nil, "", call.err
 	}
-	registry.cache[cacheKey] = store
+	call.store = store
+	close(call.done)
 	return store, path, nil
 }
 
-// isReservedScheme reports whether scheme is one Resolve always treats as
-// local, and so can never be registered: empty (bare paths), "file", or a
-// single-letter drive letter.
-func isReservedScheme(scheme string) bool {
-	return scheme == "" || scheme == "file" || isDriveLetter(scheme)
-}
-
-// isDriveLetter reports whether scheme is a single ASCII letter, as
-// produced by parsing a Windows drive-letter path like `C:\data\x` as a
-// URL: no registered scheme is ever one character, so this is an
-// unambiguous signal to treat the location as local instead.
+// isDriveLetter reports whether scheme is a single ASCII letter — the
+// scheme url.Parse assigns to a Windows drive-letter path like
+// `C:\data\x` or `C:/data/x`. It is not on its own a signal to treat a
+// location as local: combined with an empty Host (see Resolve), it is —
+// a registered single-letter scheme used with a real "://" authority
+// (e.g. `x://host/key`) has a non-empty Host and is not affected.
 func isDriveLetter(scheme string) bool {
 	if len(scheme) != 1 {
 		return false

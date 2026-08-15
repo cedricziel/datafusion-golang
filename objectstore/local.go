@@ -50,6 +50,13 @@ type localObject struct {
 
 func (o *localObject) Size() int64 { return o.size }
 
+// localTmpPrefix marks in-flight commit files distinctly from any real
+// object name, so List (which matches by string prefix) never yields an
+// uncommitted or crash-orphaned temp file as if it were a committed
+// object — a temp file for "orders.parquet" no longer shares that name's
+// own prefix.
+const localTmpPrefix = ".objectstore-tmp-"
+
 // localWriter commits by writing to a temp file in the target's directory,
 // fsyncing it, and renaming it over the target on Close — the same
 // pattern providers/parquet/insert.go used directly before this package
@@ -61,7 +68,7 @@ func (localStore) Create(_ context.Context, path string) (Writer, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("objectstore: preparing directory for %q: %w", path, err)
 	}
-	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	tmp, err := os.CreateTemp(dir, localTmpPrefix+filepath.Base(path)+"-*")
 	if err != nil {
 		return nil, fmt.Errorf("objectstore: creating temp file for %q: %w", path, err)
 	}
@@ -119,20 +126,26 @@ func (localStore) Remove(_ context.Context, path string) error {
 	return nil
 }
 
+// List walks prefix's parent directory and yields every entry whose full
+// path has prefix as a string prefix — deliberately not special-casing
+// "prefix is itself an existing directory": doing so used to make List
+// directory-scoped in that case (missing a sibling like "ab" when
+// listing prefix "a"), inconsistent with the mem backend's pure
+// string-prefix matching. Walking the parent uniformly matches it.
 func (localStore) List(_ context.Context, prefix string) iter.Seq2[ObjectInfo, error] {
 	return func(yield func(ObjectInfo, error) bool) {
-		base := prefix
-		if info, err := os.Stat(base); err != nil || !info.IsDir() {
-			base = filepath.Dir(prefix)
-			if _, err := os.Stat(base); err != nil {
-				return
+		base := filepath.Dir(prefix)
+		if _, err := os.Stat(base); err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				yield(ObjectInfo{}, fmt.Errorf("objectstore: list %q: %w", prefix, err))
 			}
+			return
 		}
-		_ = filepath.WalkDir(base, func(path string, d fs.DirEntry, err error) error {
+		err := filepath.WalkDir(base, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
-			if d.IsDir() || !strings.HasPrefix(path, prefix) {
+			if d.IsDir() || strings.HasPrefix(d.Name(), localTmpPrefix) || !strings.HasPrefix(path, prefix) {
 				return nil
 			}
 			info, err := d.Info()
@@ -147,5 +160,8 @@ func (localStore) List(_ context.Context, prefix string) iter.Seq2[ObjectInfo, e
 			}
 			return nil
 		})
+		if err != nil {
+			yield(ObjectInfo{}, fmt.Errorf("objectstore: list %q: %w", prefix, err))
+		}
 	}
 }
