@@ -51,7 +51,8 @@ func s3Location(t *testing.T, bucket, key string) string {
 // end.
 func TestS3Integration_ScanPushdownAndInsert(t *testing.T) {
 	bucket := s3TestBucket(t)
-	location := s3Location(t, bucket, "s3-integration-"+t.Name()+"/people.parquet")
+	location := s3Location(t, bucket, "s3-integration-"+uniqueTestSuffix(t)+"/people.parquet")
+	removeOnCleanup(t, location)
 
 	schema := peopleSchema()
 	batch := peopleBatch(t, schema, []int64{1, 2}, []string{"alice", "bob"})

@@ -43,7 +43,8 @@ func gcsLocation(t *testing.T, bucket, key string) string {
 // now against the gs:// scheme end to end.
 func TestGCSIntegration_ScanPushdownAndInsert(t *testing.T) {
 	bucket := gcsTestBucket(t)
-	location := gcsLocation(t, bucket, "gcs-integration-"+t.Name()+"/people.parquet")
+	location := gcsLocation(t, bucket, "gcs-integration-"+uniqueTestSuffix(t)+"/people.parquet")
+	removeOnCleanup(t, location)
 
 	schema := peopleSchema()
 	batch := peopleBatch(t, schema, []int64{1, 2}, []string{"alice", "bob"})
