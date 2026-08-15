@@ -19,10 +19,10 @@ Phases 1–6 are deliberately independent merge units: each leaves `main` green,
 
 ## 3. Phase 3 — S3 backend
 
-- [ ] 3.1 Implement the shared gocloud.dev/blob adapter (`ReaderAt` over `NewRangeReader`, size via `Attributes`, writer, list) and contract-test it against `memblob`
-- [ ] 3.2 Add `objectstore/s3`: `s3` scheme registration via gocloud `s3blob` URL opener, query-param passthrough (region, endpoint, path-style), store caching per scheme+authority+query
-- [ ] 3.3 Add env-gated S3 integration test (skips without e.g. `OBJECTSTORE_S3_TEST_URL`; runnable against MinIO) covering parquet scan+pushdown and INSERT through SQL
-- [ ] 3.4 Document S3 usage (import line, URL forms, credential chain, last-writer-wins caveat)
+- [x] 3.1 Implement the shared gocloud.dev/blob adapter (`ReaderAt` over `NewRangeReader`, size via `Attributes`, writer, list) and contract-test it against `memblob`
+- [x] 3.2 Add `objectstore/s3`: `s3` scheme registration via gocloud `s3blob` URL opener, query-param passthrough (region, endpoint, path-style), store caching per scheme+authority+query
+- [x] 3.3 Add env-gated S3 integration test (skips without e.g. `OBJECTSTORE_S3_TEST_URL`; runnable against MinIO) covering parquet scan+pushdown and INSERT through SQL
+- [x] 3.4 Document S3 usage (import line, URL forms, credential chain, last-writer-wins caveat)
 
 ## 4. Phase 4 — GCS backend
 
