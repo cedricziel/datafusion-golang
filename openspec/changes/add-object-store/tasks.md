@@ -42,5 +42,5 @@ Phases 1–6 are deliberately independent merge units: each leaves `main` green,
 
 ## 7. Wrap-up
 
-- [ ] 7.1 Re-run full test suite, `make lint && make format`, `/simplify`
-- [ ] 7.2 Validate the change (`openspec validate add-object-store --strict`) and sync/archive per project workflow
+- [x] 7.1 Re-run full test suite, `make lint && make format`, `/simplify`
+- [x] 7.2 Validate the change (`openspec validate add-object-store --strict`) and sync/archive per project workflow
