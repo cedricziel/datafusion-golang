@@ -1,16 +1,40 @@
-// Package providertest holds small test doubles and assertions shared by
-// providers/parquet and providers/iceberg's InsertInto test suites. It has
-// no dependency on either provider package, only arrow-go, so importing it
-// adds nothing to either provider's own dependency footprint.
+// Package providertest holds small test doubles and assertions shared
+// across the provider packages' test suites. It has no dependency on any
+// provider package, only arrow-go and objectstore, so importing it adds
+// nothing to a provider's own dependency footprint.
 package providertest
 
 import (
+	"context"
 	"errors"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/cedricziel/datafusion-golang/objectstore"
 )
+
+// WriteObject writes contents to location through the objectstore
+// package — the shared mem://-fixture-writing step behind every
+// provider's "valid object on a registered backend" test.
+func WriteObject(t *testing.T, location, contents string) {
+	t.Helper()
+	ctx := context.Background()
+	store, path, err := objectstore.Resolve(ctx, location)
+	if err != nil {
+		t.Fatalf("Resolve %s: %v", location, err)
+	}
+	w, err := store.Create(ctx, path)
+	if err != nil {
+		t.Fatalf("Create %s: %v", location, err)
+	}
+	if _, err := w.Write([]byte(contents)); err != nil {
+		t.Fatalf("Write %s: %v", location, err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close %s: %v", location, err)
+	}
+}
 
 // ErrAfterReader wraps a RecordReader and fails after successfully
 // yielding FailAfter batches, so tests can inject a mid-stream failure at

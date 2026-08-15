@@ -3,14 +3,13 @@ package parquet
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	pqparquet "github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/cedricziel/datafusion-golang/datafusion"
+	"github.com/cedricziel/datafusion-golang/objectstore"
 )
 
 var (
@@ -18,12 +17,14 @@ var (
 	arrowWriteProps = pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema())
 )
 
-// keepOpenWriter wraps an *os.File so passing it to pqarrow.NewFileWriter
-// does not hand the writer authority to close the file: FileWriter.Close
-// closes its underlying io.Writer when that writer implements io.Closer,
-// which would otherwise close tmp before rewrite can fsync it ahead of the
-// rename (design D1's durability requirement).
-type keepOpenWriter struct{ *os.File }
+// keepOpenWriter wraps an objectstore.Writer so passing it to
+// pqarrow.NewFileWriter does not hand the writer authority to commit:
+// FileWriter.Close closes its underlying io.Writer when that writer
+// implements io.Closer, which would otherwise commit the object as a
+// side effect of the parquet writer finalizing its footer, before
+// rewrite has decided the insert succeeded (design D1's durability
+// requirement — commit is the last, explicit step).
+type keepOpenWriter struct{ objectstore.Writer }
 
 func (keepOpenWriter) Close() error { return nil }
 
@@ -40,13 +41,16 @@ func rebindSchema(rec arrow.RecordBatch, schema *arrow.Schema) arrow.RecordBatch
 }
 
 // InsertInto implements datafusion.WritableTableProvider. Append and
-// Overwrite are both delivered as "write a complete temp file in the same
-// directory, then atomically rename it over the original" — Parquet's
+// Overwrite are both delivered as "write a complete new object, then
+// commit it over the original via the store's Writer" — Parquet's
 // footer-at-end format has no API to append to a closed file. Append
-// additionally streams the existing file's rows ahead of the insert's
+// additionally streams the existing object's rows ahead of the insert's
 // rows; Overwrite writes only the insert's rows. Any failure — reading
-// the input, writing, or closing the temp file — removes the temp file
-// and leaves the original untouched; only a successful rename commits.
+// the input, writing, or finalizing — aborts the write and leaves the
+// original object untouched; only a successful commit (Writer.Close)
+// publishes the new one. Commit atomicity is per-backend: see
+// objectstore's Writer contract and design D5 for what each backend
+// family guarantees.
 //
 // The reported count is the number of rows consumed from rows, not the
 // table's resulting size, matching Overwrite's "replaced size" ambiguity
@@ -76,28 +80,25 @@ func (t *tableProvider) InsertInto(ctx context.Context, op datafusion.InsertOp, 
 	return t.rewrite(ctx, op, rows, hasFirst)
 }
 
-// rewrite performs the temp-file-then-rename commit described on
-// InsertInto. hasFirst indicates rows.Next() already returned true once
-// (its current batch is the first one to write) before rewrite was
-// called; the zero-row-Overwrite case calls this with hasFirst false.
+// rewrite performs the commit-on-Close write described on InsertInto.
+// hasFirst indicates rows.Next() already returned true once (its current
+// batch is the first one to write) before rewrite was called; the
+// zero-row-Overwrite case calls this with hasFirst false.
 func (t *tableProvider) rewrite(ctx context.Context, op datafusion.InsertOp, rows array.RecordReader, hasFirst bool) (rowCount uint64, err error) {
-	dir := filepath.Dir(t.path)
-	tmp, err := os.CreateTemp(dir, filepath.Base(t.path)+".tmp-*")
+	w, err := t.store.Create(ctx, t.path)
 	if err != nil {
-		return 0, fmt.Errorf("parquet: creating temp file for insert: %w", err)
+		return 0, fmt.Errorf("parquet: creating writer for insert: %w", err)
 	}
-	tmpPath := tmp.Name()
-	// Cleanup on any path that doesn't reach the final rename: close (if
-	// not already) and remove the temp file, leaving the original intact.
+	// Cleanup on any path that doesn't reach the final commit: abort the
+	// write, leaving the original object intact.
 	committed := false
 	defer func() {
 		if !committed {
-			_ = tmp.Close()
-			_ = os.Remove(tmpPath)
+			_ = w.Abort()
 		}
 	}()
 
-	fw, err := pqarrow.NewFileWriter(t.schema, keepOpenWriter{tmp}, writeProps, arrowWriteProps)
+	fw, err := pqarrow.NewFileWriter(t.schema, keepOpenWriter{w}, writeProps, arrowWriteProps)
 	if err != nil {
 		return 0, fmt.Errorf("parquet: opening writer for insert: %w", err)
 	}
@@ -135,13 +136,7 @@ func (t *tableProvider) rewrite(ctx context.Context, op datafusion.InsertOp, row
 	if err := fw.Close(); err != nil {
 		return 0, fmt.Errorf("parquet: finalizing insert: %w", err)
 	}
-	if err := tmp.Sync(); err != nil {
-		return 0, fmt.Errorf("parquet: syncing insert: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return 0, fmt.Errorf("parquet: closing insert file: %w", err)
-	}
-	if err := os.Rename(tmpPath, t.path); err != nil {
+	if err := w.Close(); err != nil {
 		return 0, fmt.Errorf("parquet: committing insert: %w", err)
 	}
 	committed = true

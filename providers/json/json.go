@@ -12,54 +12,69 @@ package json
 import (
 	"context"
 	"fmt"
-	"os"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/cedricziel/datafusion-golang/datafusion"
+	"github.com/cedricziel/datafusion-golang/objectstore"
 )
 
-// tableProvider is a datafusion.TableProvider backed by a local JSON
-// array-of-objects file at path.
+// tableProvider is a datafusion.TableProvider backed by a JSON
+// array-of-objects object at path within store.
 type tableProvider struct {
+	store  objectstore.Store
 	path   string
 	schema *arrow.Schema
 }
 
-// NewTableProvider opens the JSON file at path, decoding it against
-// schema to validate content and caching the schema. Construction fails
-// if the file does not exist, is not readable, its top level is not a
-// JSON array, or its content does not decode against schema.
-func NewTableProvider(path string, schema *arrow.Schema) (datafusion.TableProvider, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("json: open %s: %w", path, err)
-	}
-	defer f.Close()
+// Option configures NewTableProvider.
+type Option = objectstore.Option
 
-	rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, schema, f)
+// WithStore overrides the backend location resolves against, bypassing
+// the objectstore registry: location is then used as-is as the in-store
+// path. Intended for tests and explicitly configured buckets.
+func WithStore(store objectstore.Store) Option { return objectstore.WithStore(store) }
+
+// NewTableProvider opens the JSON object at location, decoding it against
+// schema to validate content and caching the schema. Construction fails
+// if location's scheme is not registered, the object does not exist, is
+// not readable, its top level is not a JSON array, or its content does
+// not decode against schema.
+func NewTableProvider(ctx context.Context, location string, schema *arrow.Schema, opts ...Option) (datafusion.TableProvider, error) {
+	store, path, err := objectstore.ResolveWithOptions(ctx, location, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("json: decode %s: %w", path, err)
+		return nil, fmt.Errorf("json: resolving %s: %w", location, err)
+	}
+
+	obj, err := store.Open(ctx, path)
+	if err != nil {
+		return nil, fmt.Errorf("json: open %s: %w", location, err)
+	}
+	defer obj.Close()
+
+	rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, schema, obj)
+	if err != nil {
+		return nil, fmt.Errorf("json: decode %s: %w", location, err)
 	}
 	rec.Release()
 
-	return &tableProvider{path: path, schema: schema}, nil
+	return &tableProvider{store: store, path: path, schema: schema}, nil
 }
 
 func (t *tableProvider) Schema() *arrow.Schema { return t.schema }
 
-// Scan decodes the whole file into one record batch and wraps it in a
-// RecordReader that owns no file handle: the file is opened, decoded, and
-// closed before Scan returns, so there is no window during which the
-// returned reader holds an open file descriptor.
+// Scan decodes the whole object into one record batch and wraps it in a
+// RecordReader that owns no open handle: the object is opened, decoded,
+// and closed before Scan returns, so there is no window during which the
+// returned reader holds an open handle.
 func (t *tableProvider) Scan(ctx context.Context) (array.RecordReader, error) {
-	f, err := os.Open(t.path)
+	obj, err := t.store.Open(ctx, t.path)
 	if err != nil {
 		return nil, fmt.Errorf("json: open %s: %w", t.path, err)
 	}
-	rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, t.schema, f)
-	closeErr := f.Close()
+	rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, t.schema, obj)
+	closeErr := obj.Close()
 	if err != nil {
 		return nil, fmt.Errorf("json: decode %s: %w", t.path, err)
 	}

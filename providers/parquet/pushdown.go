@@ -23,9 +23,9 @@ func (t *tableProvider) ScanWithOptions(ctx context.Context, opts *datafusion.Sc
 		return t.Scan(ctx)
 	}
 
-	rdr, err := file.OpenParquetFile(t.path, false)
+	rdr, err := openReader(ctx, t.store, t.path)
 	if err != nil {
-		return nil, fmt.Errorf("parquet: open %s: %w", t.path, err)
+		return nil, err
 	}
 
 	fr, err := pqarrow.NewFileReader(rdr, readProps, memory.DefaultAllocator)
