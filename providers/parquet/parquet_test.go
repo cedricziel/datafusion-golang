@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	pqparquet "github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/cedricziel/datafusion-golang/datafusion"
+	"github.com/cedricziel/datafusion-golang/objectstore"
 	provider "github.com/cedricziel/datafusion-golang/providers/parquet"
 )
 
@@ -64,6 +66,34 @@ func writeParquetFile(t *testing.T, dir, name string, schema *arrow.Schema, batc
 	return path
 }
 
+// writeParquetToStore writes batches to a Parquet object at location
+// through the objectstore package, mirroring writeParquetFile for
+// locations on any registered backend (e.g. mem://).
+func writeParquetToStore(t *testing.T, location string, schema *arrow.Schema, batches ...arrow.RecordBatch) {
+	t.Helper()
+	ctx := context.Background()
+	store, path, err := objectstore.Resolve(ctx, location)
+	if err != nil {
+		t.Fatalf("Resolve %s: %v", location, err)
+	}
+	w, err := store.Create(ctx, path)
+	if err != nil {
+		t.Fatalf("Create %s: %v", location, err)
+	}
+	fw, err := pqarrow.NewFileWriter(schema, w, pqparquet.NewWriterProperties(), pqarrow.DefaultWriterProps())
+	if err != nil {
+		t.Fatalf("NewFileWriter: %v", err)
+	}
+	for i, rec := range batches {
+		if err := fw.Write(rec); err != nil {
+			t.Fatalf("Write batch %d: %v", i, err)
+		}
+	}
+	if err := fw.Close(); err != nil {
+		t.Fatalf("Close writer: %v", err)
+	}
+}
+
 func collectRows(t *testing.T, reader array.RecordReader) (ids []int64, names []string) {
 	t.Helper()
 	defer reader.Release()
@@ -82,6 +112,41 @@ func collectRows(t *testing.T, reader array.RecordReader) (ids []int64, names []
 	return ids, names
 }
 
+// TestNewTableProvider_ValidObjectOnRegisteredBackend covers the
+// object-store spec's "Valid object on a registered backend" scenario:
+// construction and querying work identically over a mem:// location, not
+// just a bare local path.
+func TestNewTableProvider_ValidObjectOnRegisteredBackend(t *testing.T) {
+	schema := peopleSchema()
+	batch := peopleBatch(t, schema, []int64{1, 2}, []string{"alice", "bob"})
+	defer batch.Release()
+	location := "mem://" + t.Name() + "/people.parquet"
+	writeParquetToStore(t, location, schema, batch)
+
+	p, err := provider.NewTableProvider(context.Background(), location)
+	if err != nil {
+		t.Fatalf("NewTableProvider: %v", err)
+	}
+
+	sess, err := datafusion.NewSessionContext()
+	if err != nil {
+		t.Fatalf("NewSessionContext: %v", err)
+	}
+	defer sess.Close()
+	if err := sess.RegisterTable("people", p); err != nil {
+		t.Fatalf("RegisterTable: %v", err)
+	}
+
+	reader, err := sess.SQL("SELECT id, name FROM people ORDER BY id")
+	if err != nil {
+		t.Fatalf("SQL: %v", err)
+	}
+	ids, names := collectRows(t, reader)
+	if !reflect.DeepEqual(ids, []int64{1, 2}) || !reflect.DeepEqual(names, []string{"alice", "bob"}) {
+		t.Fatalf("got ids=%v names=%v, want [1 2] [alice bob]", ids, names)
+	}
+}
+
 func TestNewTableProvider_ValidFile(t *testing.T) {
 	dir := t.TempDir()
 	schema := peopleSchema()
@@ -89,7 +154,7 @@ func TestNewTableProvider_ValidFile(t *testing.T) {
 	defer batch.Release()
 	path := writeParquetFile(t, dir, "people.parquet", schema, batch)
 
-	p, err := provider.NewTableProvider(path)
+	p, err := provider.NewTableProvider(context.Background(), path)
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -105,7 +170,7 @@ func TestNewTableProvider_ValidFile(t *testing.T) {
 }
 
 func TestNewTableProvider_MissingFile(t *testing.T) {
-	_, err := provider.NewTableProvider(filepath.Join(t.TempDir(), "does-not-exist.parquet"))
+	_, err := provider.NewTableProvider(context.Background(), filepath.Join(t.TempDir(), "does-not-exist.parquet"))
 	if err == nil {
 		t.Fatalf("expected an error for a missing file")
 	}
@@ -117,7 +182,7 @@ func TestNewTableProvider_InvalidFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte("this is not a parquet file"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	_, err := provider.NewTableProvider(path)
+	_, err := provider.NewTableProvider(context.Background(), path)
 	if err == nil {
 		t.Fatalf("expected an error for an invalid parquet file")
 	}
@@ -132,7 +197,7 @@ func TestScan_MultiRowGroup(t *testing.T) {
 	defer b2.Release()
 	path := writeParquetFile(t, dir, "people.parquet", schema, b1, b2)
 
-	p, err := provider.NewTableProvider(path)
+	p, err := provider.NewTableProvider(context.Background(), path)
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -159,7 +224,7 @@ func TestScan_EmptyFile(t *testing.T) {
 	schema := peopleSchema()
 	path := writeParquetFile(t, dir, "empty.parquet", schema)
 
-	p, err := provider.NewTableProvider(path)
+	p, err := provider.NewTableProvider(context.Background(), path)
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -203,7 +268,7 @@ func TestScan_RepeatedSequentialScansDoNotLeakFileDescriptors(t *testing.T) {
 	defer batch.Release()
 	path := writeParquetFile(t, dir, "people.parquet", schema, batch)
 
-	p, err := provider.NewTableProvider(path)
+	p, err := provider.NewTableProvider(context.Background(), path)
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -234,7 +299,7 @@ func TestScan_ConcurrentScansEachReturnFullResults(t *testing.T) {
 	defer b2.Release()
 	path := writeParquetFile(t, dir, "people.parquet", schema, b1, b2)
 
-	p, err := provider.NewTableProvider(path)
+	p, err := provider.NewTableProvider(context.Background(), path)
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -273,7 +338,7 @@ func TestRegisterAndQueryViaSQL(t *testing.T) {
 	defer batch.Release()
 	path := writeParquetFile(t, dir, "people.parquet", schema, batch)
 
-	p, err := provider.NewTableProvider(path)
+	p, err := provider.NewTableProvider(context.Background(), path)
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}

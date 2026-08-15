@@ -3,6 +3,7 @@ package parquet_test
 import (
 	"context"
 	"crypto/sha256"
+	"io"
 	"os"
 	"sync"
 	"testing"
@@ -10,9 +11,54 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/cedricziel/datafusion-golang/datafusion"
+	"github.com/cedricziel/datafusion-golang/objectstore"
 	"github.com/cedricziel/datafusion-golang/providers/internal/providertest"
 	provider "github.com/cedricziel/datafusion-golang/providers/parquet"
 )
+
+// memObjectBytes reads the full current bytes of the object at location,
+// which must resolve to an already-registered backend.
+func memObjectBytes(t *testing.T, location string) []byte {
+	t.Helper()
+	ctx := context.Background()
+	store, path, err := objectstore.Resolve(ctx, location)
+	if err != nil {
+		t.Fatalf("Resolve %s: %v", location, err)
+	}
+	obj, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open %s: %v", location, err)
+	}
+	defer obj.Close()
+	data, err := io.ReadAll(io.NewSectionReader(obj, 0, obj.Size()))
+	if err != nil {
+		t.Fatalf("reading %s: %v", location, err)
+	}
+	return data
+}
+
+// noLeftoverMemObjects asserts prefix contains exactly the objects named
+// in wantPaths, mirroring noLeftoverTempFiles for the mem:// backend.
+func noLeftoverMemObjects(t *testing.T, prefix string, wantPaths ...string) {
+	t.Helper()
+	ctx := context.Background()
+	store, path, err := objectstore.Resolve(ctx, prefix)
+	if err != nil {
+		t.Fatalf("Resolve %s: %v", prefix, err)
+	}
+	want := map[string]bool{}
+	for _, p := range wantPaths {
+		want[p] = true
+	}
+	for info, err := range store.List(ctx, path) {
+		if err != nil {
+			t.Fatalf("List %s: %v", prefix, err)
+		}
+		if !want[info.Path] {
+			t.Fatalf("unexpected leftover object under %s: %s", prefix, info.Path)
+		}
+	}
+}
 
 func fileHash(t *testing.T, path string) [32]byte {
 	t.Helper()
@@ -41,7 +87,7 @@ func newWritableProvider(t *testing.T, path string) interface {
 	datafusion.WritableTableProvider
 } {
 	t.Helper()
-	p, err := provider.NewTableProvider(path)
+	p, err := provider.NewTableProvider(context.Background(), path)
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -178,7 +224,7 @@ func TestInsertInto_SchemaRoundTrips(t *testing.T) {
 		t.Fatalf("InsertInto: %v", err)
 	}
 
-	fresh, err := provider.NewTableProvider(path)
+	fresh, err := provider.NewTableProvider(context.Background(), path)
 	if err != nil {
 		t.Fatalf("NewTableProvider after insert: %v", err)
 	}
@@ -361,4 +407,68 @@ func TestInsertInto_PushdownAgreesWithFullScanAfterRewrite(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestInsertInto_MemBackedRoundTrips covers the parquet-table-provider
+// spec's "Insert into an object-store-backed table round-trips" scenario:
+// INSERT against a mem://-backed table behaves identically to a
+// local-path one.
+func TestInsertInto_MemBackedRoundTrips(t *testing.T) {
+	schema := peopleSchema()
+	batch := peopleBatch(t, schema, []int64{1}, []string{"alice"})
+	defer batch.Release()
+	location := "mem://" + t.Name() + "/people.parquet"
+	writeParquetToStore(t, location, schema, batch)
+
+	p := newWritableProvider(t, location)
+	rows := providertest.NewRowsReader(t, schema, peopleBatch(t, schema, []int64{2}, []string{"bob"}))
+	count, err := p.InsertInto(context.Background(), datafusion.InsertAppend, rows)
+	if err != nil {
+		t.Fatalf("InsertInto: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected count=1, got %d", count)
+	}
+
+	reader, err := p.Scan(context.Background())
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	ids, names := collectRows(t, reader)
+	if len(ids) != 2 {
+		t.Fatalf("expected 2 combined rows, got %v", ids)
+	}
+	found := map[string]bool{}
+	for _, n := range names {
+		found[n] = true
+	}
+	if !found["alice"] || !found["bob"] {
+		t.Fatalf("expected both alice and bob, got %v", names)
+	}
+}
+
+// TestInsertInto_FailingInsertLeavesOriginalUnchanged_MemBackend covers
+// the parquet-table-provider spec's "Failed insert on a non-local
+// backend" scenario: a failed insert against a mem://-backed table
+// leaves the prior object's exact bytes and no partial object anywhere
+// in the store.
+func TestInsertInto_FailingInsertLeavesOriginalUnchanged_MemBackend(t *testing.T) {
+	schema := peopleSchema()
+	batch := peopleBatch(t, schema, []int64{1}, []string{"alice"})
+	defer batch.Release()
+	location := "mem://" + t.Name() + "/people.parquet"
+	writeParquetToStore(t, location, schema, batch)
+	before := memObjectBytes(t, location)
+
+	p := newWritableProvider(t, location)
+	inner := providertest.NewRowsReader(t, schema, peopleBatch(t, schema, []int64{2}, []string{"bob"}))
+	rows := &providertest.ErrAfterReader{RecordReader: inner, FailAfter: 0}
+
+	if _, err := p.InsertInto(context.Background(), datafusion.InsertAppend, rows); err == nil {
+		t.Fatalf("expected the injected read failure to abort the insert")
+	}
+	if got := memObjectBytes(t, location); string(got) != string(before) {
+		t.Fatalf("original object must be byte-identical after a failed insert")
+	}
+	noLeftoverMemObjects(t, "mem://"+t.Name()+"/", "people.parquet")
 }

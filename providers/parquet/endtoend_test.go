@@ -1,6 +1,7 @@
 package parquet_test
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -17,7 +18,7 @@ func TestInsertInto_SQL_ValuesThenSelectSeesRows(t *testing.T) {
 	defer batch.Release()
 	path := writeParquetFile(t, dir, "people.parquet", schema, batch)
 
-	p, err := provider.NewTableProvider(path)
+	p, err := provider.NewTableProvider(context.Background(), path)
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -58,7 +59,7 @@ func TestInsertInto_SQL_SelectFromAnotherRegisteredTable(t *testing.T) {
 	srcBatch := peopleBatch(t, schema, []int64{10, 20}, []string{"src1", "src2"})
 	defer srcBatch.Release()
 	srcPath := writeParquetFile(t, dir, "src.parquet", schema, srcBatch)
-	src, err := provider.NewTableProvider(srcPath)
+	src, err := provider.NewTableProvider(context.Background(), srcPath)
 	if err != nil {
 		t.Fatalf("NewTableProvider(src): %v", err)
 	}
@@ -66,7 +67,7 @@ func TestInsertInto_SQL_SelectFromAnotherRegisteredTable(t *testing.T) {
 	dstBatch := peopleBatch(t, schema, []int64{1}, []string{"alice"})
 	defer dstBatch.Release()
 	dstPath := writeParquetFile(t, dir, "dst.parquet", schema, dstBatch)
-	dst, err := provider.NewTableProvider(dstPath)
+	dst, err := provider.NewTableProvider(context.Background(), dstPath)
 	if err != nil {
 		t.Fatalf("NewTableProvider(dst): %v", err)
 	}
@@ -111,7 +112,7 @@ func TestInsertInto_SQL_ColumnSubsetFillsOmittedWithNull(t *testing.T) {
 	defer batch.Release()
 	path := writeParquetFile(t, dir, "people.parquet", schema, batch)
 
-	p, err := provider.NewTableProvider(path)
+	p, err := provider.NewTableProvider(context.Background(), path)
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -153,7 +154,7 @@ func TestInsertInto_SQL_Overwrite(t *testing.T) {
 	defer batch.Release()
 	path := writeParquetFile(t, dir, "people.parquet", schema, batch)
 
-	p, err := provider.NewTableProvider(path)
+	p, err := provider.NewTableProvider(context.Background(), path)
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -192,7 +193,7 @@ func TestInsertInto_SQL_ReplaceFailsCleanlyAndSessionStaysUsable(t *testing.T) {
 	path := writeParquetFile(t, dir, "people.parquet", schema, batch)
 	before := fileHash(t, path)
 
-	p, err := provider.NewTableProvider(path)
+	p, err := provider.NewTableProvider(context.Background(), path)
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}

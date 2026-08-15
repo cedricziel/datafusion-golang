@@ -283,12 +283,14 @@ in their dependencies:
 
 ### `providers/parquet`
 
-Queries a local Parquet file directly:
+Queries a Parquet object — a bare local path or a URL whose scheme is
+registered with `objectstore` (`file://`, `mem://`, and, once imported,
+`s3://`/`gs://`/`azblob://`):
 
 ```go
 import parquetprovider "github.com/cedricziel/datafusion-golang/providers/parquet"
 
-table, err := parquetprovider.NewTableProvider("/path/to/file.parquet")
+table, err := parquetprovider.NewTableProvider(context.Background(), "/path/to/file.parquet")
 if err != nil {
     log.Fatal(err)
 }

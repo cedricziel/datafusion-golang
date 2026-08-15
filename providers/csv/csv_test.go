@@ -14,6 +14,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/cedricziel/datafusion-golang/datafusion"
 	provider "github.com/cedricziel/datafusion-golang/providers/csv"
+	"github.com/cedricziel/datafusion-golang/providers/internal/providertest"
 )
 
 func peopleSchema() *arrow.Schema {
@@ -31,6 +32,34 @@ func writeCSV(t *testing.T, contents string) string {
 		t.Fatalf("WriteFile: %v", err)
 	}
 	return path
+}
+
+// TestNewTableProvider_ValidObjectOnRegisteredBackend covers the
+// object-store spec's "Valid object on a registered backend" scenario.
+func TestNewTableProvider_ValidObjectOnRegisteredBackend(t *testing.T) {
+	location := "mem://" + t.Name() + "/data.csv"
+	providertest.WriteObject(t, location, "id,name\n1,alice\n2,bob\n")
+
+	p, err := provider.NewTableProvider(context.Background(), location, peopleSchema())
+	if err != nil {
+		t.Fatalf("NewTableProvider: %v", err)
+	}
+	sess, err := datafusion.NewSessionContext()
+	if err != nil {
+		t.Fatalf("NewSessionContext: %v", err)
+	}
+	defer sess.Close()
+	if err := sess.RegisterTable("people", p); err != nil {
+		t.Fatalf("RegisterTable: %v", err)
+	}
+	reader, err := sess.SQL("SELECT id, name FROM people ORDER BY id")
+	if err != nil {
+		t.Fatalf("SQL: %v", err)
+	}
+	ids, names := collectRows(t, reader)
+	if len(ids) != 2 || ids[0] != 1 || ids[1] != 2 || names[0] != "alice" || names[1] != "bob" {
+		t.Fatalf("got ids=%v names=%v, want [1 2] [alice bob]", ids, names)
+	}
 }
 
 func collectRows(t *testing.T, reader array.RecordReader) (ids []int64, names []string) {
@@ -53,7 +82,7 @@ func collectRows(t *testing.T, reader array.RecordReader) (ids []int64, names []
 
 func TestNewTableProvider_ValidFile(t *testing.T) {
 	path := writeCSV(t, "id,name\n1,alice\n2,bob\n")
-	p, err := provider.NewTableProvider(path, peopleSchema())
+	p, err := provider.NewTableProvider(context.Background(), path, peopleSchema())
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -84,7 +113,7 @@ func TestNewTableProvider_FieldNamesComeFromSchemaNotHeaderText(t *testing.T) {
 	// arrow-go's own csv.Reader (WithHeader(true)) renames fields to the
 	// header's text by default.
 	path := writeCSV(t, "ID,Name\n1,alice\n2,bob\n")
-	p, err := provider.NewTableProvider(path, peopleSchema())
+	p, err := provider.NewTableProvider(context.Background(), path, peopleSchema())
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -107,7 +136,7 @@ func TestNewTableProvider_FieldNamesComeFromSchemaNotHeaderText(t *testing.T) {
 }
 
 func TestNewTableProvider_MissingFile(t *testing.T) {
-	_, err := provider.NewTableProvider(filepath.Join(t.TempDir(), "missing.csv"), peopleSchema())
+	_, err := provider.NewTableProvider(context.Background(), filepath.Join(t.TempDir(), "missing.csv"), peopleSchema())
 	if err == nil {
 		t.Fatalf("expected an error for a missing file")
 	}
@@ -115,7 +144,7 @@ func TestNewTableProvider_MissingFile(t *testing.T) {
 
 func TestNewTableProvider_ColumnCountMismatch(t *testing.T) {
 	path := writeCSV(t, "id,name,extra\n1,alice,x\n")
-	_, err := provider.NewTableProvider(path, peopleSchema())
+	_, err := provider.NewTableProvider(context.Background(), path, peopleSchema())
 	if err == nil {
 		t.Fatalf("expected an error for a column count mismatch")
 	}
@@ -123,17 +152,17 @@ func TestNewTableProvider_ColumnCountMismatch(t *testing.T) {
 
 func TestNewTableProvider_NoHeaderRowAtAllFails(t *testing.T) {
 	path := writeCSV(t, "")
-	if _, err := provider.NewTableProvider(path, peopleSchema()); err == nil {
+	if _, err := provider.NewTableProvider(context.Background(), path, peopleSchema()); err == nil {
 		t.Fatalf("expected an error for a file with no header row")
 	}
-	if _, err := provider.NewTableProviderWithInferredSchema(path); err == nil {
+	if _, err := provider.NewTableProviderWithInferredSchema(context.Background(), path); err == nil {
 		t.Fatalf("expected an error for a file with no header row")
 	}
 }
 
 func TestNewTableProvider_EmptyDataFile(t *testing.T) {
 	path := writeCSV(t, "id,name\n")
-	p, err := provider.NewTableProvider(path, peopleSchema())
+	p, err := provider.NewTableProvider(context.Background(), path, peopleSchema())
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -152,7 +181,7 @@ func TestNewTableProvider_EmptyDataFile(t *testing.T) {
 
 func TestNewTableProviderWithInferredSchema_ValidFile(t *testing.T) {
 	path := writeCSV(t, "id,name\n1,alice\n2,bob\n")
-	p, err := provider.NewTableProviderWithInferredSchema(path)
+	p, err := provider.NewTableProviderWithInferredSchema(context.Background(), path)
 	if err != nil {
 		t.Fatalf("NewTableProviderWithInferredSchema: %v", err)
 	}
@@ -185,7 +214,7 @@ func TestNewTableProviderWithInferredSchema_ValidFile(t *testing.T) {
 
 func TestNewTableProviderWithInferredSchema_HeaderOnlyFails(t *testing.T) {
 	path := writeCSV(t, "id,name\n")
-	_, err := provider.NewTableProviderWithInferredSchema(path)
+	_, err := provider.NewTableProviderWithInferredSchema(context.Background(), path)
 	if err == nil {
 		t.Fatalf("expected an error: no data rows to infer types from")
 	}
@@ -197,7 +226,7 @@ func TestNewTableProviderWithInferredSchema_LaterRowTypeMismatchSurfacesViaErr(t
 	// producing a null field and ending the scan on the following Next(),
 	// with the failure exposed only via Err() (design D3).
 	path := writeCSV(t, "id,name\n1,alice\nnotanumber,bob\n3,carol\n")
-	p, err := provider.NewTableProviderWithInferredSchema(path)
+	p, err := provider.NewTableProviderWithInferredSchema(context.Background(), path)
 	if err != nil {
 		t.Fatalf("NewTableProviderWithInferredSchema: %v", err)
 	}
@@ -216,7 +245,7 @@ func TestNewTableProviderWithInferredSchema_LaterRowTypeMismatchSurfacesViaErr(t
 
 func TestScan_MultiRowCorrectness(t *testing.T) {
 	path := writeCSV(t, "id,name\n1,alice\n2,bob\n3,carol\n4,dave\n")
-	p, err := provider.NewTableProvider(path, peopleSchema())
+	p, err := provider.NewTableProvider(context.Background(), path, peopleSchema())
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -238,7 +267,7 @@ func TestScan_MultiRowCorrectness(t *testing.T) {
 
 func TestRegisterAndQueryViaSQL(t *testing.T) {
 	path := writeCSV(t, "id,name\n1,alice\n2,bob\n")
-	p, err := provider.NewTableProvider(path, peopleSchema())
+	p, err := provider.NewTableProvider(context.Background(), path, peopleSchema())
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -283,7 +312,7 @@ func openFDCount(t *testing.T) int {
 
 func TestScan_RepeatedScansDoNotLeakFileDescriptors(t *testing.T) {
 	path := writeCSV(t, "id,name\n1,alice\n2,bob\n")
-	p, err := provider.NewTableProvider(path, peopleSchema())
+	p, err := provider.NewTableProvider(context.Background(), path, peopleSchema())
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -307,7 +336,7 @@ func TestScan_RepeatedScansDoNotLeakFileDescriptors(t *testing.T) {
 
 func TestScan_ConcurrentScansEachReturnFullResults(t *testing.T) {
 	path := writeCSV(t, "id,name\n1,alice\n2,bob\n3,carol\n4,dave\n")
-	p, err := provider.NewTableProvider(path, peopleSchema())
+	p, err := provider.NewTableProvider(context.Background(), path, peopleSchema())
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}

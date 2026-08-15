@@ -323,7 +323,7 @@ func main() {
 	}
 	defer sess.Close()
 
-	events, err := parquetprovider.NewTableProvider(path)
+	events, err := parquetprovider.NewTableProvider(context.Background(), path)
 	if err != nil {
 		log.Fatalf("parquet.NewTableProvider: %v", err)
 	}

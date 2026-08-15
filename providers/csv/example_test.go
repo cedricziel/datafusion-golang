@@ -1,6 +1,7 @@
 package csv_test
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -29,7 +30,7 @@ func Example() {
 		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
 	}, nil)
 
-	table, err := csvprovider.NewTableProvider(path, schema)
+	table, err := csvprovider.NewTableProvider(context.Background(), path, schema)
 	if err != nil {
 		panic(err)
 	}

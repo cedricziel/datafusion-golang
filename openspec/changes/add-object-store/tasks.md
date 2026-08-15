@@ -11,11 +11,11 @@ Phases 1–6 are deliberately independent merge units: each leaves `main` green,
 
 ## 2. Phase 2 — providers on the abstraction (parity refactor + mem coverage)
 
-- [ ] 2.1 **BREAKING** Rework `providers/parquet` reads: constructors take `(ctx, location)`, resolve through `objectstore`, and parquet.go/pushdown.go open via `file.NewParquetReader(obj, …)`; add a `WithStore` option
-- [ ] 2.2 Rework `providers/parquet/insert.go` onto `store.Create` commit-on-Close, deleting the temp/rename code; keep `insertMu` and all failure-cleanup semantics
-- [ ] 2.3 **BREAKING** Rework `providers/csv`, `providers/json`, `providers/jsonl` constructors/scans onto `(ctx, location)` + `objectstore` sequential reads, replacing `os.Open`/`*os.File` in the closing-reader types
-- [ ] 2.4 Extend provider test matrices to run against `mem://` locations (construction, scan, pushdown-pruning byte-range assertions via an instrumented store, INSERT round-trip and failure atomicity per the spec deltas)
-- [ ] 2.5 Update examples and docs for the new signatures; `make lint && make format`; run `/simplify` over the diff
+- [x] 2.1 **BREAKING** Rework `providers/parquet` reads: constructors take `(ctx, location)`, resolve through `objectstore`, and parquet.go/pushdown.go open via `file.NewParquetReader(obj, …)`; add a `WithStore` option
+- [x] 2.2 Rework `providers/parquet/insert.go` onto `store.Create` commit-on-Close, deleting the temp/rename code; keep `insertMu` and all failure-cleanup semantics
+- [x] 2.3 **BREAKING** Rework `providers/csv`, `providers/json`, `providers/jsonl` constructors/scans onto `(ctx, location)` + `objectstore` sequential reads, replacing `os.Open`/`*os.File` in the closing-reader types
+- [x] 2.4 Extend provider test matrices to run against `mem://` locations (construction, scan, pushdown-pruning byte-range assertions via an instrumented store, INSERT round-trip and failure atomicity per the spec deltas)
+- [x] 2.5 Update examples and docs for the new signatures; `make lint && make format`; run `/simplify` over the diff
 
 ## 3. Phase 3 — S3 backend
 

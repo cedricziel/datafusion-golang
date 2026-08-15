@@ -13,6 +13,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/cedricziel/datafusion-golang/datafusion"
+	"github.com/cedricziel/datafusion-golang/providers/internal/providertest"
 	provider "github.com/cedricziel/datafusion-golang/providers/json"
 )
 
@@ -31,6 +32,34 @@ func writeJSON(t *testing.T, contents string) string {
 		t.Fatalf("WriteFile: %v", err)
 	}
 	return path
+}
+
+// TestNewTableProvider_ValidObjectOnRegisteredBackend covers the
+// object-store spec's "Valid object on a registered backend" scenario.
+func TestNewTableProvider_ValidObjectOnRegisteredBackend(t *testing.T) {
+	location := "mem://" + t.Name() + "/data.json"
+	providertest.WriteObject(t, location, `[{"id":1,"name":"alice"},{"id":2,"name":"bob"}]`)
+
+	p, err := provider.NewTableProvider(context.Background(), location, peopleSchema())
+	if err != nil {
+		t.Fatalf("NewTableProvider: %v", err)
+	}
+	sess, err := datafusion.NewSessionContext()
+	if err != nil {
+		t.Fatalf("NewSessionContext: %v", err)
+	}
+	defer sess.Close()
+	if err := sess.RegisterTable("people", p); err != nil {
+		t.Fatalf("RegisterTable: %v", err)
+	}
+	reader, err := sess.SQL("SELECT id, name FROM people ORDER BY id")
+	if err != nil {
+		t.Fatalf("SQL: %v", err)
+	}
+	ids, names := collectRows(t, reader)
+	if len(ids) != 2 || ids[0] != 1 || ids[1] != 2 || names[0] != "alice" || names[1] != "bob" {
+		t.Fatalf("got ids=%v names=%v, want [1 2] [alice bob]", ids, names)
+	}
 }
 
 func collectRows(t *testing.T, reader array.RecordReader) (ids []int64, names []string) {
@@ -53,7 +82,7 @@ func collectRows(t *testing.T, reader array.RecordReader) (ids []int64, names []
 
 func TestNewTableProvider_ValidFile(t *testing.T) {
 	path := writeJSON(t, `[{"id":1,"name":"alice"},{"id":2,"name":"bob"}]`)
-	p, err := provider.NewTableProvider(path, peopleSchema())
+	p, err := provider.NewTableProvider(context.Background(), path, peopleSchema())
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -75,7 +104,7 @@ func TestNewTableProvider_ValidFile(t *testing.T) {
 }
 
 func TestNewTableProvider_MissingFile(t *testing.T) {
-	_, err := provider.NewTableProvider(filepath.Join(t.TempDir(), "missing.json"), peopleSchema())
+	_, err := provider.NewTableProvider(context.Background(), filepath.Join(t.TempDir(), "missing.json"), peopleSchema())
 	if err == nil {
 		t.Fatalf("expected an error for a missing file")
 	}
@@ -83,7 +112,7 @@ func TestNewTableProvider_MissingFile(t *testing.T) {
 
 func TestNewTableProvider_TopLevelNotArray(t *testing.T) {
 	path := writeJSON(t, `{"id":1,"name":"alice"}`)
-	_, err := provider.NewTableProvider(path, peopleSchema())
+	_, err := provider.NewTableProvider(context.Background(), path, peopleSchema())
 	if err == nil {
 		t.Fatalf("expected an error when the top level is not a JSON array")
 	}
@@ -91,7 +120,7 @@ func TestNewTableProvider_TopLevelNotArray(t *testing.T) {
 
 func TestNewTableProvider_ContentSchemaMismatch(t *testing.T) {
 	path := writeJSON(t, `[{"id":"not-a-number","name":"alice"}]`)
-	_, err := provider.NewTableProvider(path, peopleSchema())
+	_, err := provider.NewTableProvider(context.Background(), path, peopleSchema())
 	if err == nil {
 		t.Fatalf("expected an error for a content/schema mismatch")
 	}
@@ -103,7 +132,7 @@ func TestNewTableProvider_EmptyArray(t *testing.T) {
 	// readers, which return zero batches for empty input — so the
 	// contract here is "zero total rows," not "zero batches."
 	path := writeJSON(t, `[]`)
-	p, err := provider.NewTableProvider(path, peopleSchema())
+	p, err := provider.NewTableProvider(context.Background(), path, peopleSchema())
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -126,7 +155,7 @@ func TestNewTableProvider_EmptyArray(t *testing.T) {
 
 func TestScan_MultiElementCorrectnessInFileOrderAsSingleBatch(t *testing.T) {
 	path := writeJSON(t, `[{"id":1,"name":"alice"},{"id":2,"name":"bob"},{"id":3,"name":"carol"},{"id":4,"name":"dave"}]`)
-	p, err := provider.NewTableProvider(path, peopleSchema())
+	p, err := provider.NewTableProvider(context.Background(), path, peopleSchema())
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -160,7 +189,7 @@ func TestScan_MultiElementCorrectnessInFileOrderAsSingleBatch(t *testing.T) {
 
 func TestRegisterAndQueryViaSQL(t *testing.T) {
 	path := writeJSON(t, `[{"id":1,"name":"alice"},{"id":2,"name":"bob"}]`)
-	p, err := provider.NewTableProvider(path, peopleSchema())
+	p, err := provider.NewTableProvider(context.Background(), path, peopleSchema())
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -205,7 +234,7 @@ func openFDCount(t *testing.T) int {
 
 func TestScan_RepeatedScansDoNotLeakFileDescriptors(t *testing.T) {
 	path := writeJSON(t, `[{"id":1,"name":"alice"},{"id":2,"name":"bob"}]`)
-	p, err := provider.NewTableProvider(path, peopleSchema())
+	p, err := provider.NewTableProvider(context.Background(), path, peopleSchema())
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -229,7 +258,7 @@ func TestScan_RepeatedScansDoNotLeakFileDescriptors(t *testing.T) {
 
 func TestScan_ConcurrentScansEachReturnFullResults(t *testing.T) {
 	path := writeJSON(t, `[{"id":1,"name":"alice"},{"id":2,"name":"bob"},{"id":3,"name":"carol"},{"id":4,"name":"dave"}]`)
-	p, err := provider.NewTableProvider(path, peopleSchema())
+	p, err := provider.NewTableProvider(context.Background(), path, peopleSchema())
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
