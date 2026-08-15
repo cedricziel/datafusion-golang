@@ -53,13 +53,37 @@ func newProvider(ctx context.Context, load func(context.Context) (*table.Table, 
 	return &tableProvider{schema: schema, load: load, describe: describe}, nil
 }
 
+// Option configures NewTableProvider.
+type Option func(*options)
+
+type options struct {
+	ioProps map[string]string
+}
+
+// WithIOProps supplies properties (endpoint overrides, credentials-related
+// settings, and any other iceberg-go file-IO property) to the file IO used
+// for every metadata and data read the provider performs. Omitted or nil,
+// behavior is unchanged from before this option existed: iceberg-go's
+// default file-IO resolution for the location's scheme. Cloud schemes
+// (s3://, gs://, abfs://, ...) additionally require the corresponding
+// iceberg-go file-IO implementation to be enabled — see
+// github.com/apache/iceberg-go/io/gocloud's package doc.
+func WithIOProps(props map[string]string) Option {
+	return func(o *options) { o.ioProps = props }
+}
+
 // NewTableProvider opens the Iceberg table whose current metadata lives at
 // metadataLocation, validating it and caching the Arrow-equivalent of its
 // current schema. Construction fails if the metadata cannot be read or
-// parsed as valid Iceberg table metadata.
-func NewTableProvider(ctx context.Context, metadataLocation string) (datafusion.TableProvider, error) {
+// parsed as valid Iceberg table metadata, or if metadataLocation's scheme
+// has no registered iceberg-go file-IO implementation.
+func NewTableProvider(ctx context.Context, metadataLocation string, opts ...Option) (datafusion.TableProvider, error) {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
 	load := func(ctx context.Context) (*table.Table, error) {
-		return loadTableFromLocation(ctx, metadataLocation)
+		return loadTableFromLocation(ctx, metadataLocation, o.ioProps)
 	}
 	return newProvider(ctx, load, func() string { return metadataLocation })
 }
@@ -121,11 +145,13 @@ func (t *tableProvider) Scan(ctx context.Context) (array.RecordReader, error) {
 
 // loadTableFromLocation loads the Iceberg table at metadataLocation with
 // no catalog service (design D3 of add-parquet-and-iceberg-table-providers).
-// The identifier is not validated against the metadata content by
-// iceberg-go; it is only used for display purposes, so a name derived from
-// the metadata path is fine here.
-func loadTableFromLocation(ctx context.Context, metadataLocation string) (*table.Table, error) {
-	fsysF := icebergio.LoadFSFunc(nil, metadataLocation)
+// ioProps is passed through to the file IO (design D6 of add-object-store);
+// nil behaves exactly as before that option existed. The identifier is not
+// validated against the metadata content by iceberg-go; it is only used
+// for display purposes, so a name derived from the metadata path is fine
+// here.
+func loadTableFromLocation(ctx context.Context, metadataLocation string, ioProps map[string]string) (*table.Table, error) {
+	fsysF := icebergio.LoadFSFunc(ioProps, metadataLocation)
 	ident := table.Identifier{"default", tableNameFromMetadataLocation(metadataLocation)}
 	tbl, err := table.NewFromLocation(ctx, ident, metadataLocation, fsysF, nil)
 	if err != nil {

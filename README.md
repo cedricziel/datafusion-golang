@@ -358,6 +358,41 @@ snapshot's data files (no snapshot selection or time travel). As with the
 Parquet provider, each scan is independent and resource-safe under
 concurrent or repeated use.
 
+**Cloud-backed tables:** `providers/iceberg` reads and writes through
+iceberg-go's own file-IO abstraction — a separate mechanism from the
+`objectstore` package the other providers use (design D6 of
+`add-object-store`; the two meet at the same underlying `gocloud.dev`
+drivers, so credentials behave identically either way). A metadata
+location on `s3://`, `gs://`, or `abfs://`/`abfss://` needs two things:
+importing `iceberg-go/io/gocloud` for its registration side effect, and
+`WithIOProps` for any settings the standard credential chain doesn't
+cover (e.g. a MinIO endpoint):
+
+```go
+import (
+    _ "github.com/apache/iceberg-go/io/gocloud" // registers s3/s3a/s3n/oss, gs, abfs/abfss
+    icebergprovider "github.com/cedricziel/datafusion-golang/providers/iceberg"
+)
+
+table, err := icebergprovider.NewTableProvider(ctx, "s3://warehouse/db/orders/metadata/v3.metadata.json",
+    icebergprovider.WithIOProps(map[string]string{
+        "s3.endpoint": "http://localhost:9000", // omit against real AWS S3
+        "s3.region":   "us-east-1",
+    }),
+)
+```
+
+Property keys are iceberg-go's own (`s3.endpoint`, `s3.region`,
+`s3.access-key-id`, `client.region`, the `ADLS*`/`GCS*` equivalents for
+Azure/GCS, ...) — see `github.com/apache/iceberg-go/io`'s constants —
+not `objectstore`'s query-parameter names, since the two schemes
+(`abfs`/`abfss` here vs. `objectstore`'s `azblob://`, for example) are
+independent and not translated between each other. Catalog-backed tables
+(`NewTableProviderFromCatalog`, below) get their cloud credentials from
+however the catalog client itself is configured; `providers/iceberg` has
+no separate property-plumbing for that path since it never constructs
+the catalog's file IO itself.
+
 Alternatively, `NewTableProviderFromCatalog` resolves a table by
 namespace-qualified identifier through any
 `github.com/apache/iceberg-go/catalog.Catalog` implementation — the caller
