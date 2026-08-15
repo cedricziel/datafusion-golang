@@ -26,8 +26,8 @@ Phases 1–6 are deliberately independent merge units: each leaves `main` green,
 
 ## 4. Phase 4 — GCS backend
 
-- [ ] 4.1 Add `objectstore/gcs`: `gs` scheme via `gcsblob`, ADC credential chain, query-param passthrough
-- [ ] 4.2 Env-gated GCS integration test (fake-gcs-server locally) and docs
+- [x] 4.1 Add `objectstore/gcs`: `gs` scheme via `gcsblob`, ADC credential chain, query-param passthrough
+- [x] 4.2 Env-gated GCS integration test (fake-gcs-server locally) and docs
 
 ## 5. Phase 5 — Azure Blob backend
 
