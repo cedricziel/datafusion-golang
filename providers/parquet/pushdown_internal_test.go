@@ -1,8 +1,10 @@
 package parquet
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -12,6 +14,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/cedricziel/datafusion-golang/datafusion"
+	"github.com/cedricziel/datafusion-golang/objectstore"
 )
 
 // writeFile writes one row group per batch with the given writer properties.
@@ -295,6 +298,107 @@ func TestCheapestLeaf(t *testing.T) {
 	for l := 0; l < md.Schema.NumColumns(); l++ {
 		if sizeOf(leaf) > sizeOf(l) {
 			t.Fatalf("leaf %d (size %d) is not the cheapest; %d is smaller (%d)", leaf, sizeOf(leaf), l, sizeOf(l))
+		}
+	}
+}
+
+// byteRange is a half-open [off, off+len) span, used by
+// TestScanWithOptions_PrunedRowGroupBytesNeverRequested to check that a
+// pruned row group's on-disk bytes are never requested from the backend
+// (spec: object-store's "Reads are ranged, not whole-object" and
+// parquet-table-provider's "Scans read selectively from the storage
+// backend").
+type byteRange struct{ off, len int64 }
+
+func (r byteRange) overlaps(o byteRange) bool {
+	return r.off < o.off+o.len && o.off < r.off+r.len
+}
+
+// recordingStore wraps a Store and records every ReadAt range performed
+// through it, so a test can assert which byte ranges a scan actually
+// requested from the backend.
+type recordingStore struct {
+	objectstore.Store
+	mu     sync.Mutex
+	ranges []byteRange
+}
+
+func (s *recordingStore) Open(ctx context.Context, path string) (objectstore.Object, error) {
+	obj, err := s.Store.Open(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	return &recordingObject{Object: obj, store: s}, nil
+}
+
+type recordingObject struct {
+	objectstore.Object
+	store *recordingStore
+}
+
+func (o *recordingObject) ReadAt(p []byte, off int64) (int, error) {
+	n, err := o.Object.ReadAt(p, off)
+	o.store.mu.Lock()
+	o.store.ranges = append(o.store.ranges, byteRange{off: off, len: int64(n)})
+	o.store.mu.Unlock()
+	return n, err
+}
+
+// columnChunkRange returns the on-disk byte span of column chunk col in
+// row group rg — from its dictionary page (if any, else its first data
+// page) through its total compressed size.
+func columnChunkRange(t *testing.T, rdr *file.Reader, rg, col int) byteRange {
+	t.Helper()
+	cc, err := rdr.MetaData().RowGroup(rg).ColumnChunk(col)
+	if err != nil {
+		t.Fatalf("ColumnChunk(%d, %d): %v", rg, col, err)
+	}
+	start := cc.DataPageOffset()
+	if cc.HasDictionaryPage() && cc.DictionaryPageOffset() < start {
+		start = cc.DictionaryPageOffset()
+	}
+	return byteRange{off: start, len: cc.TotalCompressedSize()}
+}
+
+func TestScanWithOptions_PrunedRowGroupBytesNeverRequested(t *testing.T) {
+	path := threeGroupFile(t, pq.NewWriterProperties())
+
+	rdr, _, _ := openReaders(t, path)
+	var excluded []byteRange
+	for col := 0; col < rdr.MetaData().Schema.NumColumns(); col++ {
+		excluded = append(excluded, columnChunkRange(t, rdr, 0, col))
+	}
+
+	rec := &recordingStore{Store: objectstore.NewLocalStore()}
+	tp, err := NewTableProvider(context.Background(), path, WithStore(rec))
+	if err != nil {
+		t.Fatalf("NewTableProvider: %v", err)
+	}
+	pd := tp.(datafusion.PushdownTableProvider)
+
+	// id > 15 provably excludes row group 0 (ids 1..10).
+	gt15 := datafusion.Compare{Column: idCol(), Op: datafusion.CompareGt, Literal: i64(15)}
+	reader, err := pd.ScanWithOptions(context.Background(), &datafusion.ScanOptions{
+		Projection: nil,
+		Filters:    []datafusion.Expr{gt15},
+		Limit:      -1,
+	})
+	if err != nil {
+		t.Fatalf("ScanWithOptions: %v", err)
+	}
+	for reader.Next() {
+	}
+	if err := reader.Err(); err != nil {
+		t.Fatalf("reading scan: %v", err)
+	}
+	reader.Release()
+
+	for _, got := range rec.ranges {
+		for _, ex := range excluded {
+			if got.overlaps(ex) {
+				t.Fatalf("scan requested range [%d,%d) which overlaps pruned row group 0's range [%d,%d)",
+					got.off, got.off+got.len, ex.off, ex.off+ex.len)
+			}
 		}
 	}
 }

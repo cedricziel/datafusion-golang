@@ -24,14 +24,16 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/cedricziel/datafusion-golang/datafusion"
+	"github.com/cedricziel/datafusion-golang/objectstore"
 )
 
 var readProps = pqarrow.ArrowReadProperties{BatchSize: 1024}
 
-// tableProvider is a datafusion.TableProvider backed by a local Parquet
-// file at path. Each Scan opens its own file.Reader so concurrent and
-// repeated scans never share state (see design D4).
+// tableProvider is a datafusion.TableProvider backed by a Parquet object
+// at path within store. Each Scan opens its own file.Reader so concurrent
+// and repeated scans never share state (see design D4).
 type tableProvider struct {
+	store  objectstore.Store
 	path   string
 	schema *arrow.Schema
 
@@ -41,38 +43,70 @@ type tableProvider struct {
 	insertMu sync.Mutex
 }
 
-// NewTableProvider opens the Parquet file at path, validating it and
-// caching its Arrow schema. Construction fails if the file does not exist,
-// is not readable, or is not a valid Parquet file.
-func NewTableProvider(path string) (datafusion.TableProvider, error) {
-	rdr, err := file.OpenParquetFile(path, false)
+// Option configures NewTableProvider.
+type Option = objectstore.Option
+
+// WithStore overrides the backend location resolves against, bypassing
+// the objectstore registry: location is then used as-is as the in-store
+// path. Intended for tests and explicitly configured buckets.
+func WithStore(store objectstore.Store) Option { return objectstore.WithStore(store) }
+
+// NewTableProvider opens the Parquet object at location — a bare local
+// path or a URL whose scheme is registered with the objectstore package
+// (file://, mem://, s3://, ...) — validating it and caching its Arrow
+// schema. Construction fails if the location's scheme is not registered,
+// the object does not exist, is not readable, or is not valid Parquet.
+func NewTableProvider(ctx context.Context, location string, opts ...Option) (datafusion.TableProvider, error) {
+	store, path, err := objectstore.ResolveWithOptions(ctx, location, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("parquet: open %s: %w", path, err)
+		return nil, fmt.Errorf("parquet: resolving %s: %w", location, err)
+	}
+
+	rdr, err := openReader(ctx, store, path)
+	if err != nil {
+		return nil, err
 	}
 	defer rdr.Close()
 
 	fr, err := pqarrow.NewFileReader(rdr, readProps, memory.DefaultAllocator)
 	if err != nil {
-		return nil, fmt.Errorf("parquet: read schema of %s: %w", path, err)
+		return nil, fmt.Errorf("parquet: read schema of %s: %w", location, err)
 	}
 	schema, err := fr.Schema()
 	if err != nil {
-		return nil, fmt.Errorf("parquet: derive arrow schema of %s: %w", path, err)
+		return nil, fmt.Errorf("parquet: derive arrow schema of %s: %w", location, err)
 	}
 
-	return &tableProvider{path: path, schema: schema}, nil
+	return &tableProvider{store: store, path: path, schema: schema}, nil
 }
 
 func (t *tableProvider) Schema() *arrow.Schema { return t.schema }
 
-// Scan opens a fresh reader over the file so this scan is independent of
-// any other concurrent or subsequent scan of the same provider (design D4).
-// The returned reader closes the underlying file when it is released or
-// exhausted (design D6).
-func (t *tableProvider) Scan(ctx context.Context) (array.RecordReader, error) {
-	rdr, err := file.OpenParquetFile(t.path, false)
+// openReader opens the Parquet object at path within store and wraps it
+// in a file.Reader, closing the object if wrapping fails. Shared by
+// NewTableProvider, Scan, and ScanWithOptions (pushdown.go) — every call
+// site that needs a fresh reader over the object.
+func openReader(ctx context.Context, store objectstore.Store, path string) (*file.Reader, error) {
+	obj, err := store.Open(ctx, path)
 	if err != nil {
-		return nil, fmt.Errorf("parquet: open %s: %w", t.path, err)
+		return nil, fmt.Errorf("parquet: open %s: %w", path, err)
+	}
+	rdr, err := file.NewParquetReader(obj)
+	if err != nil {
+		_ = obj.Close()
+		return nil, fmt.Errorf("parquet: open %s: %w", path, err)
+	}
+	return rdr, nil
+}
+
+// Scan opens a fresh reader over the object so this scan is independent
+// of any other concurrent or subsequent scan of the same provider (design
+// D4). The returned reader closes the underlying object when it is
+// released or exhausted (design D6).
+func (t *tableProvider) Scan(ctx context.Context) (array.RecordReader, error) {
+	rdr, err := openReader(ctx, t.store, t.path)
+	if err != nil {
+		return nil, err
 	}
 
 	fr, err := pqarrow.NewFileReader(rdr, readProps, memory.DefaultAllocator)

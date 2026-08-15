@@ -123,7 +123,7 @@ func writeDiffFixture(t *testing.T) string {
 
 func newDiffSessions(t *testing.T, path string) (push, full *datafusion.SessionContext) {
 	t.Helper()
-	p, err := provider.NewTableProvider(path)
+	p, err := provider.NewTableProvider(context.Background(), path)
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestPushdown_DifferentialBattery(t *testing.T) {
 
 func TestScanWithOptions_ProjectionOrderAndValues(t *testing.T) {
 	path := writeDiffFixture(t)
-	p, err := provider.NewTableProvider(path)
+	p, err := provider.NewTableProvider(context.Background(), path)
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestScanWithOptions_ProjectionOrderAndValues(t *testing.T) {
 
 func TestScanWithOptions_DuplicateProjection(t *testing.T) {
 	path := writeDiffFixture(t)
-	pd, _ := provider.NewTableProvider(path)
+	pd, _ := provider.NewTableProvider(context.Background(), path)
 	reader, err := pd.(datafusion.PushdownTableProvider).ScanWithOptions(context.Background(), &datafusion.ScanOptions{
 		Projection: []int{0, 0},
 		Limit:      -1,
@@ -251,7 +251,7 @@ func TestScanWithOptions_DuplicateProjection(t *testing.T) {
 
 func TestScanWithOptions_EmptyProjectionRowCounts(t *testing.T) {
 	path := writeDiffFixture(t)
-	pd, _ := provider.NewTableProvider(path)
+	pd, _ := provider.NewTableProvider(context.Background(), path)
 	reader, err := pd.(datafusion.PushdownTableProvider).ScanWithOptions(context.Background(), &datafusion.ScanOptions{
 		Projection: []int{},
 		Limit:      -1,
@@ -281,7 +281,7 @@ func TestScanWithOptions_EmptyProjectionRowCounts(t *testing.T) {
 
 func TestScanWithOptions_AllRowGroupsSkipped(t *testing.T) {
 	path := writeDiffFixture(t)
-	pd, _ := provider.NewTableProvider(path)
+	pd, _ := provider.NewTableProvider(context.Background(), path)
 	reader, err := pd.(datafusion.PushdownTableProvider).ScanWithOptions(context.Background(), &datafusion.ScanOptions{
 		Projection: []int{1},
 		Filters: []datafusion.Expr{datafusion.Compare{
@@ -336,7 +336,7 @@ func TestScanWithOptions_LimitStopsEarly(t *testing.T) {
 	}
 	f.Close()
 
-	pd, err := provider.NewTableProvider(path)
+	pd, err := provider.NewTableProvider(context.Background(), path)
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}
@@ -384,7 +384,7 @@ func TestScanWithOptions_NilOptionsAndEmptyFile(t *testing.T) {
 	}
 	f.Close()
 
-	pd, err := provider.NewTableProvider(path)
+	pd, err := provider.NewTableProvider(context.Background(), path)
 	if err != nil {
 		t.Fatalf("NewTableProvider: %v", err)
 	}

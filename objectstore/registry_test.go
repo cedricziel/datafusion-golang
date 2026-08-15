@@ -105,6 +105,33 @@ func TestRegisterRejectsReservedSchemes(t *testing.T) {
 	}
 }
 
+func TestResolveWithOptions_WithStoreBypassesRegistry(t *testing.T) {
+	mem := objectstore.NewLocalStore() // any Store value works as the override
+	store, path, err := objectstore.ResolveWithOptions(context.Background(), "s3://bucket/key", objectstore.WithStore(mem))
+	if err != nil {
+		t.Fatalf("ResolveWithOptions: %v", err)
+	}
+	if store != mem {
+		t.Fatal("WithStore override was not used")
+	}
+	if path != "s3://bucket/key" {
+		t.Fatalf("path = %q, want the location used as-is", path)
+	}
+}
+
+func TestResolveWithOptions_NoOptionsFallsBackToResolve(t *testing.T) {
+	store, path, err := objectstore.ResolveWithOptions(context.Background(), "/data/x.parquet")
+	if err != nil {
+		t.Fatalf("ResolveWithOptions: %v", err)
+	}
+	if store != objectstore.Local {
+		t.Fatal("expected the ordinary Resolve fallback for a bare path")
+	}
+	if path != "/data/x.parquet" {
+		t.Fatalf("path = %q, want %q", path, "/data/x.parquet")
+	}
+}
+
 func TestRegisterCustomOpener(t *testing.T) {
 	const scheme = "custom-test-scheme"
 	called := false

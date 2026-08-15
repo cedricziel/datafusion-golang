@@ -54,7 +54,7 @@ func main() {
 	}
 	defer sess.Close()
 
-	products, err := parquetprovider.NewTableProvider(productsPath)
+	products, err := parquetprovider.NewTableProvider(ctx, productsPath)
 	if err != nil {
 		log.Fatalf("parquet.NewTableProvider: %v", err)
 	}

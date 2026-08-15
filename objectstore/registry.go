@@ -155,6 +155,39 @@ func Resolve(ctx context.Context, location string) (Store, string, error) {
 	return store, path, nil
 }
 
+// Option configures ResolveWithOptions.
+type Option func(*Options)
+
+// Options is Option's target; exported so callers building their own
+// Option values (rather than using WithStore) can populate it directly.
+type Options struct {
+	Store Store
+}
+
+// WithStore overrides the backend a location resolves against, bypassing
+// the registry entirely: location is then used as-is as the in-store
+// path, not parsed as a URL. Intended for tests and explicitly configured
+// buckets — the programmatic escape hatch described in design D3. Every
+// provider package (parquet, csv, json, jsonl) re-exports this as its own
+// WithStore so callers don't import objectstore directly for the common
+// case, but they share this one implementation.
+func WithStore(store Store) Option {
+	return func(o *Options) { o.Store = store }
+}
+
+// ResolveWithOptions is Resolve, except a Store supplied via WithStore
+// bypasses resolution entirely instead of being looked up by scheme.
+func ResolveWithOptions(ctx context.Context, location string, opts ...Option) (Store, string, error) {
+	var o Options
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if o.Store != nil {
+		return o.Store, location, nil
+	}
+	return Resolve(ctx, location)
+}
+
 // isDriveLetter reports whether scheme is a single ASCII letter — the
 // scheme url.Parse assigns to a Windows drive-letter path like
 // `C:\data\x` or `C:/data/x`. It is not on its own a signal to treat a
