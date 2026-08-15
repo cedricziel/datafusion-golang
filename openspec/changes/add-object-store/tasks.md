@@ -31,8 +31,8 @@ Phases 1–6 are deliberately independent merge units: each leaves `main` green,
 
 ## 5. Phase 5 — Azure Blob backend
 
-- [ ] 5.1 Add `objectstore/azure`: `azblob` scheme via `azureblob`, default-credential chain, query-param passthrough
-- [ ] 5.2 Env-gated Azure integration test (Azurite locally) and docs
+- [x] 5.1 Add `objectstore/azure`: `azblob` scheme via `azureblob`, default-credential chain, query-param passthrough
+- [x] 5.2 Env-gated Azure integration test (Azurite locally) and docs
 
 ## 6. Phase 6 — Iceberg cloud wiring
 
