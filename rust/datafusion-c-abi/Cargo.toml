@@ -8,7 +8,7 @@ publish = false
 crate-type = ["staticlib"]
 
 [dependencies]
-arrow = { version = "58.4.0", features = ["ffi"] }
+arrow = { version = "59.2.0", features = ["ffi"] }
 async-trait = "0.1"
 base64 = "0.23"
 datafusion = "54.1.0"
